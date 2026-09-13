@@ -358,11 +358,7 @@ function nearestOffset(fw) {
     // No same-major match — fall back to 12.00 (closest available kernel)
     return "12.00";
 }
-const offsetFw = nearestOffset(window.fw_str);
-if (offsetFw !== window.fw_str) {
-    jbmark("OFFSET-FALLBACK", "fw=" + window.fw_str + "-using=" + offsetFw);
-    console.warn("[slopkit] No exact offset file for " + window.fw_str + ", falling back to " + offsetFw);
-}
+const offsetFw = window.fw_str;
 
 let fwScript = document.createElement('script');
 document.body.appendChild(fwScript);
