@@ -5,14 +5,15 @@ if (!navigator.userAgent.includes('PlayStation 5')) {
 
 const supportedFirmwares = [
     "9.00", "9.05", "9.20", "9.40", "9.60", "10.00", "10.01", "10.20",
-    "10.40", "10.60", "11.00", "11.20", "11.40", "11.60", "12.00"
+    "10.40", "10.60", "11.00", "11.20", "11.40", "11.60", "12.00",
+    "12.02", "12.20", "12.40", "12.60", "12.70",
+    "13.00", "13.20", "13.40", "13.60"
 ];
 const fw_match = /PlayStation 5\/(\d+\.\d+)/.exec(navigator.userAgent);
 window.fw_str = fw_match ? fw_match[1] : "";
 window.fw_float = parseFloat(window.fw_str);
 
 if (!supportedFirmwares.includes(fw_str)) {
-
     alert(`Firmware ${fw_str} is unsupported.\n\nSupported: ${supportedFirmwares.join(", ")}`);
     throw new Error("no offsets for fw " + fw_str);
 }
@@ -339,7 +340,31 @@ async function prepare(p) {
 
     return { p: p2, chain: chain };
 }
+// Offset fallback: use nearest available offset file for unsupported firmware versions
+const OFFSET_FILES = [
+    "9.00", "9.05", "9.20", "9.40", "9.60",
+    "10.00", "10.01", "10.20", "10.40", "10.60",
+    "11.00", "11.20", "11.40", "11.60", "12.00"
+];
+function nearestOffset(fw) {
+    if (OFFSET_FILES.includes(fw)) return fw;
+    // Try same major version, pick highest available
+    const maj = fw.split(".")[0];
+    const candidates = OFFSET_FILES
+        .filter(f => f.startsWith(maj + "."))
+        .sort()
+        .reverse();
+    if (candidates.length) return candidates[0];
+    // No same-major match — fall back to 12.00 (closest available kernel)
+    return "12.00";
+}
+const offsetFw = nearestOffset(window.fw_str);
+if (offsetFw !== window.fw_str) {
+    jbmark("OFFSET-FALLBACK", "fw=" + window.fw_str + "-using=" + offsetFw);
+    console.warn("[slopkit] No exact offset file for " + window.fw_str + ", falling back to " + offsetFw);
+}
+
 let fwScript = document.createElement('script');
 document.body.appendChild(fwScript);
 
-fwScript.setAttribute('src', `../offsets/${window.fw_str}.js?v=final`);
+fwScript.setAttribute('src', `../offsets/${offsetFw}.js?v=final`);
