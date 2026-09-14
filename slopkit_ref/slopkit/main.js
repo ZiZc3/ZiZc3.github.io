@@ -340,25 +340,26 @@ async function prepare(p) {
 
     return { p: p2, chain: chain };
 }
-// Offset fallback: use nearest available offset file for unsupported firmware versions
+// Offset fallback: use nearest available offset file for unsupported firmware versions.
+// 13.60 is a supported target and has its own module in ../offsets/13.60.js.
 const OFFSET_FILES = [
     "9.00", "9.05", "9.20", "9.40", "9.60",
     "10.00", "10.01", "10.20", "10.40", "10.60",
-    "11.00", "11.20", "11.40", "11.60", "12.00"
+    "11.00", "11.20", "11.40", "11.60",
+    "12.00", "12.02", "12.20", "12.40", "12.60", "12.70",
+    "13.00", "13.20", "13.40", "13.60"
 ];
 function nearestOffset(fw) {
     if (OFFSET_FILES.includes(fw)) return fw;
-    // Try same major version, pick highest available
     const maj = fw.split(".")[0];
     const candidates = OFFSET_FILES
         .filter(f => f.startsWith(maj + "."))
         .sort()
         .reverse();
     if (candidates.length) return candidates[0];
-    // No same-major match — fall back to 12.00 (closest available kernel)
     return "12.00";
 }
-const offsetFw = window.fw_str;
+const offsetFw = nearestOffset(window.fw_str);
 
 let fwScript = document.createElement('script');
 document.body.appendChild(fwScript);

@@ -1,6 +1,5 @@
-// 13.60 -- generated from libSceNKWebKit / libkernel_web / libSceLibcInternal
+// 13.40 -- generated from libSceNKWebKit / libkernel_web / libSceLibcInternal
 // file offset = rva + 0x4000
-// Cross-verified against public offsets.json
 
 // host-constructor candidates: webkitBase = nativeCtorAddr - hc
 const OFFSET_wk_host_constructor_candidates = [0x00056A58, 0x00056CA0, 0x00057CE8];
@@ -22,17 +21,6 @@ const OFFSET_lc_setjmp                      = 0x0005D990;
 const OFFSET_lc_longjmp                     = 0x0005D9E0;
 
 const OFFSET_WORKER_STACK_OFFSET            = 0x0007FB88;
-
-// Values passed to notify.html / exploit.html via query string:
-//   hc  = 0x56a58,0x56ca0,0x57ce8
-//   gd  = 0x1d6fa
-//   nt  = 0x48b0
-//   gps = 0x334e238
-//   gpe = 0x1b860
-//   cls = 0x334e228
-//   cle = 0x274e0
-//   ers = 0x334e230
-//   ere = 0xf7d0
 
 let wk_gadgetmap = {
     "ret":              0x000000C7,
