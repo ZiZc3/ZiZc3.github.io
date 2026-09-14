@@ -653,26 +653,38 @@ export function makeBagagwaEngine(X) {
         if (!S.aioInited) {
             note("[S0-0b] Tier 2: aio_create (0x" + SYS_AIO_CREATE.toString(16) + ")...");
             if (P.syscalls[SYS_AIO_CREATE] !== undefined) {
-                // Try aio_create(maxReqs, flags)
-                const createR = await sys(SYS_AIO_CREATE, 8, 0);
-                note("[S0-0b] aio_create(8,0) ret=" + createR.s32 + " err=" + createR.errText);
-                if (!createR.failed && createR.s32 >= 0) {
+                // Try aio_create(maxReqs, flags). Each probe is individually
+                // try/caught so a hung/bad stub (worker no-return -> WATCHDOG
+                // throw from sys()) falls through to the next probe instead
+                // of stalling Stage 0 with no further logs.
+                let createR = null;
+                try {
+                    createR = await sys(SYS_AIO_CREATE, 8, 0);
+                    note("[S0-0b] aio_create(8,0) ret=" + createR.s32 + " err=" + createR.errText);
+                } catch (e) {
+                    note("[S0-0b] aio_create(8,0) threw: " + (e && e.message ? e.message : e) + " — trying 1-arg form");
+                }
+                if (createR && !createR.failed && createR.s32 >= 0) {
                     S.aioCtxFd = createR.s32;
                     S.aioInited = true;
                     track(S.aioCtxFd);
                     note("[S0-0b] AIO channel created via aio_create: ctxFd=" + S.aioCtxFd);
                 } else {
-                    note("[S0-0b] aio_create also denied (" + createR.errText + ")");
+                    if (createR) note("[S0-0b] aio_create also denied (" + createR.errText + ")");
                     // Try aio_create with just 1 arg (some firmware variants)
-                    const createR2 = await sys(SYS_AIO_CREATE, 8);
-                    note("[S0-0b] aio_create(8) ret=" + createR2.s32 + " err=" + createR2.errText);
-                    if (!createR2.failed && createR2.s32 >= 0) {
-                        S.aioCtxFd = createR2.s32;
-                        S.aioInited = true;
-                        track(S.aioCtxFd);
-                        note("[S0-0b] AIO channel via aio_create(1-arg): ctxFd=" + S.aioCtxFd);
-                    } else {
-                        note("[S0-0b] aio_create also blocked — AIO fully sandboxed");
+                    try {
+                        const createR2 = await sys(SYS_AIO_CREATE, 8);
+                        note("[S0-0b] aio_create(8) ret=" + createR2.s32 + " err=" + createR2.errText);
+                        if (!createR2.failed && createR2.s32 >= 0) {
+                            S.aioCtxFd = createR2.s32;
+                            S.aioInited = true;
+                            track(S.aioCtxFd);
+                            note("[S0-0b] AIO channel via aio_create(1-arg): ctxFd=" + S.aioCtxFd);
+                        } else {
+                            note("[S0-0b] aio_create also blocked — AIO fully sandboxed");
+                        }
+                    } catch (e2) {
+                        note("[S0-0b] aio_create(8) threw: " + (e2 && e2.message ? e2.message : e2) + " — continuing to Tier 3");
                     }
                 }
             } else {
@@ -685,7 +697,14 @@ export function makeBagagwaEngine(X) {
             note("[S0-0c] Tier 3: probing aio_submit_cmd (0x" + SYS_AIO_SUBMIT_CMD.toString(16) + ")...");
             if (P.syscalls[SYS_AIO_SUBMIT_CMD] !== undefined) {
                 // Probe: pass null args, just check if it's blocked or returns EINVAL
-                const probeR = await sys(SYS_AIO_SUBMIT_CMD, 0, 0, 0);
+                let probeR = null;
+                try {
+                    probeR = await sys(SYS_AIO_SUBMIT_CMD, 0, 0, 0);
+                } catch (e) {
+                    note("[S0-0c] aio_submit_cmd probe threw: " + (e && e.message ? e.message : e));
+                    out.why = "AIO probe hung (worker no-return on 0x29D) — bad stub or chain stall, see log";
+                    return out;
+                }
                 note("[S0-0c] aio_submit_cmd probe ret=" + probeR.s32 + " err=" + probeR.errText);
                 if (!probeR.failed || probeR.errText !== "EPERM") {
                     note("[S0-0c] aio_submit_cmd accessible (EINVAL/other expected) — AIO path may work");
