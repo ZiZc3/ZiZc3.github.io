@@ -653,6 +653,13 @@ export function makeBagagwaEngine(X) {
         if (!S.aioInited) {
             note("[S0-0b] Tier 2: aio_create (0x" + SYS_AIO_CREATE.toString(16) + ")...");
             if (P.syscalls[SYS_AIO_CREATE] !== undefined) {
+                // Trim heap before the risky probe so the PS5 OOM dialog
+                // doesn't fire first (and queued remote logs get ~500ms to
+                // flush). This is the exact spot the fullscreen
+                // "no free memory" used to hide the screen.
+                try { note("[S0-0b] trimming heap before probe (gc+settle)..."); } catch (_) {}
+                try { if (typeof globalThis.gc === "function") globalThis.gc(); } catch (_) {}
+                try { await sleep(600); } catch (_) {}
                 // Try aio_create(maxReqs, flags). Each probe is individually
                 // try/caught so a hung/bad stub (worker no-return -> WATCHDOG
                 // throw from sys()) falls through to the next probe instead

@@ -63,6 +63,7 @@
   <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
     <button id="btnLogSave">Save endpoint</button>
     <button id="btnLogTest">Send test</button>
+    <button id="btnNotify">Notify test</button>
     <button id="btnLogCopy">Copy log</button>
     <button id="btnLogDl">Download log.txt</button>
     <span id="logsendstat" style="align-self:center;"></span>
@@ -125,9 +126,29 @@ var __sendTimer = null;
 function _queueRemote(line) {
     if (!__logEndpoint) return;
     __logBuf.push(line);
-    if (__logBuf.length >= 20) _flushRemote();
-    else if (!__sendTimer) __sendTimer = setTimeout(_flushRemote, 2000);
+    if (__logBuf.length >= 5) _flushRemote();
+    else if (!__sendTimer) __sendTimer = setTimeout(_flushRemote, 500);
 }
+function _capLogDom() {
+    try {
+        while (logEl.childNodes.length > 400) logEl.removeChild(logEl.firstChild);
+    } catch(e) {}
+}
+try {
+    window.addEventListener("error", function (ev) {
+        try {
+            var m = "JS-ERROR: " + (ev && ev.message ? ev.message : ev);
+            _persist(m); _queueRemote(m); _flushRemote();
+        } catch(e) {}
+    });
+    window.addEventListener("unhandledrejection", function (ev) {
+        try {
+            var r = ev && ev.reason ? (ev.reason.stack || ev.reason.message || ev.reason) : ev;
+            var m = "UNHANDLED-REJECTION: " + r;
+            _persist(m); _queueRemote(m); _flushRemote();
+        } catch(e) {}
+    });
+} catch(e) {}
 function _flushRemote() {
     if (__sendTimer) { clearTimeout(__sendTimer); __sendTimer = null; }
     if (!__logEndpoint || !__logBuf.length) return;
@@ -153,6 +174,7 @@ function log(msg, cls) {
     span.className = cls || "";
     span.textContent = line + "\n";
     logEl.appendChild(span);
+    _capLogDom();
     logEl.scrollTop = logEl.scrollHeight;
     _persist(line);
     _queueRemote(line);
@@ -181,6 +203,8 @@ try {
         log("log-test: if you read this on your server, remote logging works", "info");
         _flushRemote();
     };
+    var _nt = document.getElementById("btnNotify");
+    if (_nt) _nt.onclick = function () { psNotify("Bagagwa: manual test"); };
     var _cp = document.getElementById("btnLogCopy");
     if (_cp) _cp.onclick = function () {
         try {
@@ -288,6 +312,34 @@ function note(s) {
     log(s, "step");
 }
 
+// PS5 system notification (same "userland"-style popup PSAITO shows).
+// Needs OFFSET_lk_sceKernelSendNotificationRequest (0x48B0 on 13.60).
+// Never throws: failure is logged, exploit continues.
+async function psNotify(text) {
+    try {
+        if (!P || !chain) { log("notify skipped: no chain yet", "warn"); return false; }
+        if (typeof OFFSET_lk_sceKernelSendNotificationRequest === "undefined") {
+            log("notify skipped: no notify offset for fw " + (window.fw_str || "?"), "warn");
+            return false;
+        }
+        var msg = String(text).slice(0, 200);
+        var buf = P.malloc_dump(0xC30);
+        P.write4(buf.add32(0x00), 0);
+        P.write4(buf.add32(0x10), 0xFFFFFFFF);
+        P.write4(buf.add32(0x28), 0);
+        P.write4(buf.add32(0x2C), 1);
+        P.writestr(buf.add32(0x2D), msg);
+        P.writestr(buf.add32(0x42D), "cxml://psnotification/tex_icon_system");
+        var addr = P.libKernelBase.add32(OFFSET_lk_sceKernelSendNotificationRequest);
+        var r = await watchdog(chain.call(addr, 0, buf, 0xC30, 0), "notify");
+        log("notify sent: \"" + msg + "\" ret=" + r, "ok");
+        return true;
+    } catch (e) {
+        log("notify failed: " + (e && e.message ? e.message : e), "warn");
+        return false;
+    }
+}
+
 async function init() {
     setStatus("establishing WebKit primitive...", "run");
     log("establishing WebKit exploit primitive...", "stage-hdr");
@@ -378,6 +430,7 @@ async function init() {
         log("chain operational, pid=" + pid.s32 +
             " gadgets=" + Object.keys(P.gadgets).length +
             " syscalls=" + Object.keys(P.syscalls).length, "step");
+        try { await psNotify("Bagagwa: WebKit OK pid=" + pid.s32); } catch(e) {}
         setStatus("ready — press Run Exploit", "");
         btnEl.disabled = false;
 

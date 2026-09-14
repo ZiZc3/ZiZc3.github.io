@@ -16,6 +16,7 @@ const OFFSET_lk_pthread_join                = 0x000229A0;
 const OFFSET_lk_pthread_exit                = 0x00021C20;
 const OFFSET_lk_sleep                       = 0x00027F00;
 const OFFSET_lk_sceKernelGetCurrentCpu      = 0x00001200;
+const OFFSET_lk_sceKernelSendNotificationRequest = 0x000048B0;
 
 const OFFSET_lc_memset                      = 0x00014700;
 const OFFSET_lc_setjmp                      = 0x0005D990;
