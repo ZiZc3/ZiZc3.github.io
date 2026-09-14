@@ -744,15 +744,14 @@ export function makeBagagwaEngine(X) {
                     // Don't set aioInited true here — submit_cmd has different semantics
                     // but at least AIO syscalls aren't fully blocked
                 } else {
-                    note("[S0-0c] aio_submit_cmd also EPERM — AIO subsystem fully sandboxed on this console");
-                    out.why = "AIO fully sandboxed on 13.60 WebKit: aio_init+aio_create+submit_cmd all EPERM";
-                    out.why += "\nNeed: different entry point OR non-AIO kernel exploit for 13.60";
-                    return out;
+                    // submit_cmd is a DIFFERENT syscall from submit/multi_wait:
+                    // its EPERM must not abort the stage. The probe + the real
+                    // submit below are the ground truth (upstream v9 got EPERM
+                    // on dummy multi_wait layouts = reachable, not dead).
+                    note("[S0-0c] aio_submit_cmd EPERM — continuing anyway, probe + real submit decide");
                 }
             } else {
-                note("[S0-0c] aio_submit_cmd not in stub table either");
-                out.why = "AIO subsystem fully sandboxed: all init paths blocked from WebKit on 13.60";
-                return out;
+                note("[S0-0c] aio_submit_cmd not in stub table — continuing, probe + real submit decide");
             }
         }
         // ── END AIO INIT ─────────────────────────────────────────────────────────
