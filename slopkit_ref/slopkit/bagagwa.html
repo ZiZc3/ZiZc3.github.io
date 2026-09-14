@@ -55,6 +55,20 @@
   document.getElementById('crashlog').style.display='none';
   this.style.display='none';">Cancella log salvato</button>
 <div id="log"></div>
+<div id="logtools" style="width:100%;max-width:800px;box-sizing:border-box;margin-top:10px;
+  background:#0e1420;border:1px solid #2a3340;border-radius:6px;padding:10px;font-size:13px;color:#8fa1b3;">
+  <div style="margin-bottom:6px;">Remote log server (optional): logs auto-POST here, so a PS5 crash/reload loses nothing.</div>
+  <input id="logurl" placeholder="https://... (or ?log=https://...)"
+    style="width:100%;box-sizing:border-box;padding:6px;background:#060a12;color:#cfe3ff;border:1px solid #2a3340;border-radius:4px;" />
+  <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
+    <button id="btnLogSave">Save endpoint</button>
+    <button id="btnLogTest">Send test</button>
+    <button id="btnLogCopy">Copy log</button>
+    <button id="btnLogDl">Download log.txt</button>
+    <span id="logsendstat" style="align-self:center;"></span>
+  </div>
+  <div style="margin-top:4px;opacity:.7;">Tip: open <code>?log=https://webhook.site/YOUR-ID</code> on PS5, or run <code>nc -l -p 8000</code> / <code>python3 -m http.server</code> on PC and use your PC IP. No screenshot needed.</div>
+</div>
 
 <script>
 try {
@@ -92,28 +106,106 @@ const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
 const btnEl = document.getElementById("btn");
 
+// --- persistent + remote logging (PS5-crash safe, no screenshot needed) ---
+var __logSeq = 0;
+var __logBuf = [];
+var __logEndpoint = "";
+try {
+    var q = (window.location.search || "").match(/[?&]log=([^&]+)/);
+    __logEndpoint = (q ? decodeURIComponent(q[1]) : "") || localStorage.getItem("bgw_log_endpoint") || "";
+} catch(e) {}
 function _persist(msg) {
     try {
         var cur = localStorage.getItem("bgw_log") || "";
-        if (cur.length > 16000) cur = cur.slice(-8000);
+        if (cur.length > 100000) cur = cur.slice(-60000);
         localStorage.setItem("bgw_log", cur + msg + "\n");
     } catch(e) {}
 }
+var __sendTimer = null;
+function _queueRemote(line) {
+    if (!__logEndpoint) return;
+    __logBuf.push(line);
+    if (__logBuf.length >= 20) _flushRemote();
+    else if (!__sendTimer) __sendTimer = setTimeout(_flushRemote, 2000);
+}
+function _flushRemote() {
+    if (__sendTimer) { clearTimeout(__sendTimer); __sendTimer = null; }
+    if (!__logEndpoint || !__logBuf.length) return;
+    var batch = __logBuf.splice(0, __logBuf.length).join("\n") + "\n";
+    try {
+        fetch(__logEndpoint, { method: "POST", mode: "no-cors",
+            headers: { "Content-Type": "text/plain" }, body: batch, keepalive: true });
+        var st = document.getElementById("logsendstat");
+        if (st) st.textContent = "sent @" + new Date().toLocaleTimeString();
+    } catch(e) {}
+}
+try {
+    window.addEventListener("pagehide", function () {
+        try { _flushRemote(); } catch(e) {}
+        try { if (__logEndpoint && navigator.sendBeacon)
+            navigator.sendBeacon(__logEndpoint, (localStorage.getItem("bgw_log") || "").slice(-60000)); } catch(e) {}
+    });
+} catch(e) {}
 
 function log(msg, cls) {
+    var line = (++__logSeq) + " [" + new Date().toISOString().slice(11,23) + "] " + msg;
     const span = document.createElement("span");
     span.className = cls || "";
-    span.textContent = msg + "\n";
+    span.textContent = line + "\n";
     logEl.appendChild(span);
     logEl.scrollTop = logEl.scrollHeight;
-    _persist(msg);
+    _persist(line);
+    _queueRemote(line);
 }
 
 function setStatus(text, cls) {
     statusEl.textContent = text;
     statusEl.className = cls || "";
     _persist("[STATUS] " + text);
+    _queueRemote("[STATUS] " + text);
 }
+try {
+    var _lu = document.getElementById("logurl");
+    if (_lu && __logEndpoint) _lu.value = __logEndpoint;
+    var _sv = document.getElementById("btnLogSave");
+    if (_sv) _sv.onclick = function () {
+        try {
+            __logEndpoint = document.getElementById("logurl").value.trim();
+            localStorage.setItem("bgw_log_endpoint", __logEndpoint);
+            _queueRemote("[log-endpoint-saved] " + __logEndpoint);
+            _flushRemote();
+        } catch(e) {}
+    };
+    var _ts = document.getElementById("btnLogTest");
+    if (_ts) _ts.onclick = function () {
+        log("log-test: if you read this on your server, remote logging works", "info");
+        _flushRemote();
+    };
+    var _cp = document.getElementById("btnLogCopy");
+    if (_cp) _cp.onclick = function () {
+        try {
+            var t = localStorage.getItem("bgw_log") || "";
+            if (navigator.clipboard && navigator.clipboard.writeText)
+                navigator.clipboard.writeText(t);
+            else { var ta = document.createElement("textarea"); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
+        } catch(e) {}
+    };
+    var _dl = document.getElementById("btnLogDl");
+    if (_dl) _dl.onclick = function () {
+        try {
+            var t = localStorage.getItem("bgw_log") || "";
+            var b = new Blob([t], { type: "text/plain" });
+            var a = document.createElement("a");
+            a.href = URL.createObjectURL(b); a.download = "bgw_log.txt"; a.click();
+            setTimeout(function(){ URL.revokeObjectURL(a.href); }, 5000);
+        } catch(e) {}
+    };
+    // upload previous crash log automatically once an endpoint exists
+    try {
+        var _prev = localStorage.getItem("bgw_log") || "";
+        if (_prev && __logEndpoint) _queueRemote("=== PREVIOUS-SESSION (pre-crash) ===\n" + _prev.slice(-60000));
+    } catch(e) {}
+} catch(e) {}
 
 let P = null;
 let chain = null;
