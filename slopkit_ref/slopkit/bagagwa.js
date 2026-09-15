@@ -1061,13 +1061,22 @@ export function makeBagagwaEngine(X) {
     async function probeLapseSurface() {
         const res = { socket6: null, socket4: null, rthdrSet: null, rthdrGet: null, evf: null };
         try {
-            const s6 = await sys(SYS_SOCKET, AF_INET6, SOCK_DGRAM, 0);
-            res.socket6 = s6.failed ? s6.errText : ("fd=" + s6.s32);
-            note("[LAPSE-PROBE] socket(AF_INET6,SOCK_DGRAM,0) -> " + (s6.failed ? s6.errText : "ok fd=" + s6.s32));
+            // Each call is wrapped individually so a throw (missing stub, dead
+            // chain) can NOT skip the remaining checks — we want the FULL map.
+            const pcall = async (label, num, ...args) => {
+                try {
+                    const r = await sys.apply(null, [num].concat(args));
+                    note("[LAPSE-PROBE] " + label + " -> " + (r.failed ? r.errText : "ok " + r.s32));
+                    return r;
+                } catch (e) {
+                    const m = (e && e.message ? e.message : String(e));
+                    note("[LAPSE-PROBE] " + label + " -> THREW " + m);
+                    return { failed: true, errText: "THREW", s32: -1 };
+                }
+            };
 
-            const s4 = await sys(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
-            res.socket4 = s4.failed ? s4.errText : ("fd=" + s4.s32);
-            note("[LAPSE-PROBE] socket(AF_INET,SOCK_STREAM,0) -> " + (s4.failed ? s4.errText : "ok fd=" + s4.s32));
+            const s6 = await pcall("socket(AF_INET6,SOCK_DGRAM,0)", SYS_SOCKET, AF_INET6, SOCK_DGRAM, 0);
+            const s4 = await pcall("socket(AF_INET,SOCK_STREAM,0)", SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
 
             if (!s6.failed) {
                 const rbuf = safeAlloc(0x80, "lapse-rthdr");
@@ -1075,41 +1084,40 @@ export function makeBagagwaEngine(X) {
                 if (rbuf && lenb) {
                     // minimal rthdr header; malformed -> EINVAL if reachable,
                     // EPERM/ENOTCAPABLE if blocked by the sandbox.
-                    write8(rbuf.u8, 0, 0);
-                    write8(rbuf.u8, 1, 0x0f);
-                    write8(rbuf.u8, 2, 0);
-                    write8(rbuf.u8, 3, 0);
-                    const st = await sys(SYS_SETSOCKOPT, s6.s32, IPPROTO_IPV6, IPV6_RTHDR, rbuf.base, 0x80);
-                    res.rthdrSet = st.failed ? st.errText : "ok";
-                    note("[LAPSE-PROBE] setsockopt(IPV6_RTHDR) -> " + (st.failed ? st.errText : "ok"));
+                    rbuf.u8[0] = 0;
+                    rbuf.u8[1] = 0x0f;
+                    rbuf.u8[2] = 0;
+                    rbuf.u8[3] = 0;
+                    const st = await pcall("setsockopt(IPV6_RTHDR)", SYS_SETSOCKOPT, s6.s32, IPPROTO_IPV6, IPV6_RTHDR, rbuf.base, 0x80);
+                    res.rthdrSet = st.failed ? st.errText : st.s32;
                     w32(lenb.u8, 0, 0x80);
-                    const gt = await sys(SYS_GETSOCKOPT, s6.s32, IPPROTO_IPV6, IPV6_RTHDR, rbuf.base, lenb.base);
-                    res.rthdrGet = gt.failed ? gt.errText : "ok";
-                    note("[LAPSE-PROBE] getsockopt(IPV6_RTHDR) -> " + (gt.failed ? gt.errText : "ok"));
+                    const gt = await pcall("getsockopt(IPV6_RTHDR)", SYS_GETSOCKOPT, s6.s32, IPPROTO_IPV6, IPV6_RTHDR, rbuf.base, lenb.base);
+                    res.rthdrGet = gt.failed ? gt.errText : gt.s32;
+                } else {
+                    note("[LAPSE-PROBE] setsockopt(IPV6_RTHDR) -> SKIPPED (alloc failed)");
                 }
-                await sys(SYS_CLOSE, s6.s32);
+                await pcall("close(s6)", SYS_CLOSE, s6.s32);
             }
-            if (!s4.failed) await sys(SYS_CLOSE, s4.s32);
+            if (!s4.failed) await pcall("close(s4)", SYS_CLOSE, s4.s32);
 
             const nameBuf = safeAlloc(8, "lapse-evfname");
             if (nameBuf) {
                 const nm = "lapse0";
                 for (let c = 0; c < nm.length; c++) nameBuf.u8[c] = nm.charCodeAt(c);
                 nameBuf.u8[nm.length] = 0;
-                const ec = await sys(SYS_EVF_CREATE, nameBuf.base, 0, 0);
-                res.evf = ec.failed ? ec.errText : ("id=" + ec.s32);
-                note("[LAPSE-PROBE] evf_create -> " + (ec.failed ? ec.errText : "ok id=" + ec.s32));
+                const ec = await pcall("evf_create", SYS_EVF_CREATE, nameBuf.base, 0, 0);
+                res.evf = ec.failed ? ec.errText : ec.s32;
                 if (!ec.failed) {
-                    const es = await sys(SYS_EVF_SET, ec.s32, 1);
-                    note("[LAPSE-PROBE] evf_set -> " + (es.failed ? es.errText : "ok"));
-                    const ed = await sys(SYS_EVF_DELETE, ec.s32);
-                    note("[LAPSE-PROBE] evf_delete -> " + (ed.failed ? ed.errText : "ok"));
+                    await pcall("evf_set", SYS_EVF_SET, ec.s32, 1);
+                    await pcall("evf_delete", SYS_EVF_DELETE, ec.s32);
                 }
+            } else {
+                note("[LAPSE-PROBE] evf_create -> SKIPPED (alloc failed)");
             }
 
             const s6ok = !s6.failed;
-            const rthdrReachable = res.rthdrSet === "ok" || res.rthdrSet === "EINVAL";
-            const verdict = !s6ok && s4.failed
+            const rthdrReachable = res.rthdrSet === 0 || res.rthdrSet === "EINVAL";
+            const verdict = (!s6ok && s4.failed)
                 ? "SOCKETS BLOCKED -> lapse leak unbuildable, use waker-decrement route"
                 : (!rthdrReachable
                     ? "sockets ok but IPV6_RTHDR blocked (" + res.rthdrSet + ")"
@@ -1117,7 +1125,7 @@ export function makeBagagwaEngine(X) {
             note("[LAPSE-PROBE] VERDICT: " + verdict);
             flushMark("LAPSE-PROBE", verdict);
         } catch (e) {
-            note("[LAPSE-PROBE] threw: " + (e && e.message ? e.message : e));
+            note("[LAPSE-PROBE] outer threw: " + (e && e.message ? e.message : e));
         }
         return res;
     }
