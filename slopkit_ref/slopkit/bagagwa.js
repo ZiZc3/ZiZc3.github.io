@@ -1067,6 +1067,7 @@ export function makeBagagwaEngine(X) {
     // waker-decrement route instead. One-run go/no-go, never throws.
     async function probeLapseSurface() {
         const res = { socket6: null, socket4: null, rthdrSet: null, rthdrGet: null, evf: null };
+        note("[LAPSE-PROBE] engine build=sweep3 (probe revision S3)");
         try {
             // Each call is wrapped individually so a throw (missing stub, dead
             // chain) can NOT skip the remaining checks — we want the FULL map.
