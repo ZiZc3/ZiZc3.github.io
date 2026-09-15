@@ -303,9 +303,27 @@ export function makeBagagwaEngine(X) {
     // tells us the true 13.60 signature empirically.
     async function probeAioLayouts() {
         note("[PROBE] arg-layout probe (dummy data, safe)...");
+        // Sanity first: pipe2 takes a pointer arg and is known-safe. If
+        // THIS kills the tab, pointer-arg syscalls are broken in general
+        // (not AIO-specific). If it passes, only AIO kills.
+        const pb = safeAlloc(8, "probe-pipe");
+        if (!pb) { note("[PROBE] skipped (OOM)"); return; }
+        w32(pb.u8, 0, 0); w32(pb.u8, 4, 0);
+        try {
+            note("[PROBE] trying pipe2(ptr,0)...");
+            const pr = await sys(SYS_PIPE2, pb.base, 0);
+            note("[PROBE] pipe2 -> ret=" + pr.s32 + " err=" + pr.errText);
+            if (!pr.failed) {
+                const a = r32(pb.u8, 0) | 0, b = r32(pb.u8, 4) | 0;
+                await sys(SYS_CLOSE, a); await sys(SYS_CLOSE, b);
+                note("[PROBE] pipe2 fds closed — pointer-arg syscalls WORK");
+            }
+        } catch (e) {
+            note("[PROBE] pipe2 threw: " + (e && e.message ? e.message : e));
+        }
         const zs = safeAlloc(0x40, "probe-zero-struct");
         const ids = safeAlloc(8, "probe-dummy-ids");
-        if (!zs || !ids) { note("[PROBE] skipped (OOM)"); return; }
+        if (!zs || !ids) { note("[PROBE] AIO cases skipped (OOM)"); return; }
         for (let i = 0; i < 0x40; i++) zs.u8[i] = 0;
         w32(ids.u8, 0, 0); w32(ids.u8, 4, 1);
         const cases = [
@@ -317,6 +335,7 @@ export function makeBagagwaEngine(X) {
         for (const [label, num, args] of cases) {
             if (P.syscalls[num] === undefined) { note("[PROBE] " + label + ": no stub"); continue; }
             try {
+                note("[PROBE] trying " + label + "...");
                 const r = await sys.apply(null, [num].concat(args));
                 note("[PROBE] " + label + " -> ret=" + r.s32 + " err=" + r.errText);
             } catch (e) {
