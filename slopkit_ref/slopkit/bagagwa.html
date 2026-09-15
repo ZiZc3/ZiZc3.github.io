@@ -68,7 +68,7 @@
   background:#1a0f14;border:1px solid #5a1a1a;border-radius:6px;color:#e8c0c0;
   cursor:pointer;display:none;" onclick="try{localStorage.removeItem('bgw_log')}catch(e){}
   document.getElementById('crashlog').style.display='none';
-  this.style.display='none';">Cancella log salvato</button>
+  this.style.display='none';">Clear saved log</button>
 <div id="log"></div>
 <div id="logtools" style="width:100%;max-width:800px;box-sizing:border-box;margin-top:10px;
   background:#141018;border:1px solid #2a1a2a;border-radius:6px;padding:10px;font-size:12px;color:#9a8bb0;">
@@ -81,6 +81,7 @@
     <button id="btnNotify">Notify test</button>
     <button id="btnLogCopy">Copy log</button>
     <button id="btnLogDl">Download log.txt</button>
+    <button id="btnLogClear">Clear log</button>
     <span id="logsendstat" style="align-self:center;"></span>
   </div>
   <div style="margin-top:4px;opacity:.7;">Tip: <code>?log=https://webhook.site/YOUR-ID</code> or PC <code>http://192.168.x.x:8000</code></div>
@@ -241,6 +242,19 @@ try {
             var a = document.createElement("a");
             a.href = URL.createObjectURL(b); a.download = "bgw_log.txt"; a.click();
             setTimeout(function(){ URL.revokeObjectURL(a.href); }, 5000);
+        } catch(e) {}
+    };
+    var _cl = document.getElementById("btnLogClear");
+    if (_cl) _cl.onclick = function () {
+        try {
+            logEl.textContent = "";
+            __logSeq = 0;
+            try { localStorage.removeItem("bgw_log"); } catch(e) {}
+            var cl = document.getElementById("crashlog");
+            if (cl) cl.style.display = "none";
+            var bc = document.getElementById("btnClear");
+            if (bc) bc.style.display = "none";
+            log("log cleared", "warn");
         } catch(e) {}
     };
     // upload previous crash log automatically once an endpoint exists
