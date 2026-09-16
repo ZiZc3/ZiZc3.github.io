@@ -396,6 +396,13 @@ async function prepare(p) {
     }
     jbmark("PREP-GETPID-OK", "pid=" + pid.low);
 
+    // [727-removal] expose the thread-hunt kernel addresses to the engine:
+    // worker_stack / return_address_ptr are REAL kernel pointers found via
+    // OFFSET_lk__thread_list (0x6C218, live-verified on 13.60) — the free
+    // kernel-address leak that replaces the 727 debug-info channel.
+    p2.kernelStack = worker_stack;
+    p2.returnAddressPtr = return_address_ptr;
+    p2.originalReturnAddress = original_return_address;
     return { p: p2, chain: chain };
 }
 // Offset fallback: use nearest available offset file for unsupported firmware versions.
