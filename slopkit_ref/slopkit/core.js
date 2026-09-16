@@ -1,5 +1,25 @@
-const DRAIN_COUNT = 512;
-const AUTO_RETRY_DELAY_MS = 50;
+// [OOM-fix] DRAIN_COUNT via ?n= (PSAITO parity, min 64). Default 512 x 64KB
+// = 32MB pinned per attempt; ?n=64 cuts that to 4MB. Each attempt also builds
+// the ~72MB addrof carrier, so lowering n directly lowers the per-attempt
+// peak that triggers the PS5 "not enough free memory" dialog.
+const DRAIN_COUNT = (() => {
+    try {
+        const m = ((globalThis.location && globalThis.location.search) || "").match(/[?&]n=(\d+)/);
+        const v = m ? parseInt(m[1], 10) : 512;
+        return Math.max(64, Math.min(1024, isNaN(v) ? 512 : v));
+    } catch { return 512; }
+})();
+// [OOM-fix] retry settle delay via ?rd= (PSAITO parity). The old fixed floor
+// was 750ms — far too short for WebKit to actually COLLECT the ~110MB the
+// failed attempt pinned, so attempts stacked and hit the WebProcess quota.
+// Pass rd=3000 (or higher) between-attempt settle time.
+const AUTO_RETRY_DELAY_MS = (() => {
+    try {
+        const m = ((globalThis.location && globalThis.location.search) || "").match(/[?&]rd=(\d+)/);
+        const v = m ? parseInt(m[1], 10) : 50;
+        return Math.max(0, Math.min(60000, isNaN(v) ? 50 : v));
+    } catch { return 50; }
+})();
 
 const K = 2;
 const DUPLICATE_INDEX = 2;
@@ -352,6 +372,17 @@ function releaseAttemptAllocations() {
     if (typeof globalThis.gc === "function") {
         try { globalThis.gc(); } catch { }
     }
+    // [OOM-fix] Nulling refs does NOT free ArrayBuffer backings until a GC
+    // actually sweeps them, and globalThis.gc is absent on stock JSC. Eden
+    // pressure from short-lived object churn nudges the collector to run NOW
+    // (during the rd= settle window) instead of mid-next-attempt when the
+    // old ~110MB is still uncollected and the quota dialog goes up.
+    try {
+        for (let i = 0; i < 400; ++i) {
+            const junk = { a: i, b: i * 3.1, c: [i, i + 1, i + 2, i + 3] };
+            if (junk.c[0] === -1) throw junk;
+        }
+    } catch { }
 }
 
 function scheduleSafeRetry(reason) {

