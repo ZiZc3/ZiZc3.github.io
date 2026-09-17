@@ -24,6 +24,19 @@ const OFFSET_lc_longjmp                     = 0x0005D9E0;
 
 const OFFSET_WORKER_STACK_OFFSET            = 0x0007FB88;
 
+// [kbase-recovery] GOT anchors (X1NON-verified 13.40/13.60 family).
+// gps/cls/ers = WebKit GOT slots for the getpid/close/error imports;
+// gpe/cle/ere = their export RVAs inside libkernel. Each pair gives an
+// independent libKernelBase equation: read8(wk+slot) - export_rva.
+// Used by main.js to recover from a bad guard-slot pair instead of
+// crashing (port of PSAITO d0bf84d).
+const OFFSET_wk_getpid_import               = 0x0334E238; // gps
+const OFFSET_lk_getpid_export               = 0x001B860;  // gpe
+const OFFSET_wk_close_import                = 0x0334E228; // cls
+const OFFSET_lk_close_export                = 0x00274E0;  // cle
+const OFFSET_wk_error_import                = 0x0334E230; // ers
+const OFFSET_lk_error_export                = 0x000F7D0;  // ere
+
 // Values passed to notify.html / exploit.html via query string:
 //   hc  = 0x56a58,0x56ca0,0x57ce8
 //   gd  = 0x1d6fa
