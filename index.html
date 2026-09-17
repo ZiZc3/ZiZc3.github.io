@@ -1,11 +1,228 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="0;url=slopkit_ref/slopkit/bagagwa.html">
-<title>Bagagwa Exploit</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Demon Bagagwa · ZiZ — PS5</title>
+<style>
+  /* Natural dark theme — flat, no glow, no animation. Built to be tiny and
+     fast on the PS5 browser. */
+  :root {
+    --paper: #16140f;
+    --card:  #1e1b15;
+    --ink:   #e6e1d3;
+    --muted: #8f897a;
+    --line:  #2e2b24;
+    --moss:  #e08a3c;
+    --moss-d:#c9722a;
+    --terra: #d0684d;
+    --amber: #d0a04a;
+    --slate: #7fa3c4;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: var(--paper); color: var(--ink); }
+  body {
+    min-height: 100vh;
+    font: 14px/1.5 Georgia, "Times New Roman", serif;
+    display: flex; justify-content: center;
+    padding: 40px 20px;
+  }
+  .sheet { width: 100%; max-width: 560px; }
+
+  .wordmark {
+    font: 700 11px/1 Verdana, sans-serif;
+    letter-spacing: .35em; text-transform: uppercase;
+    color: var(--muted);
+    padding-bottom: 14px; border-bottom: 2px solid var(--ink);
+    display: flex; justify-content: space-between; align-items: baseline;
+  }
+  .wordmark i { font-style: normal; letter-spacing: .1em; }
+
+  h1 {
+    font: 400 44px/1.1 Georgia, serif;
+    letter-spacing: .01em;
+    margin: 34px 0 6px;
+  }
+  h1 span { color: var(--moss); font-style: italic; }
+  .tagline {
+    color: var(--muted); font-style: italic; font-size: 14px;
+    margin-bottom: 34px;
+  }
+
+  .fwline {
+    display: flex; align-items: baseline; gap: 10px;
+    padding: 12px 0; border-top: 1px solid var(--line);
+    font-size: 15px;
+  }
+  .fwline .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--line); align-self: center; flex-shrink: 0;
+  }
+  .fwline .dot.ok { background: var(--moss); }
+  .fwline .dot.warn { background: #c99a3f; }
+  .fwline .dot.err { background: var(--terra); }
+  .fwline .lbl {
+    font: 700 10px/1 Verdana, sans-serif;
+    letter-spacing: .25em; text-transform: uppercase; color: var(--muted);
+  }
+  .fwline .val { flex: 1; }
+  .fwline .tag {
+    font: 700 9px/1 Verdana, sans-serif; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--moss);
+    border: 1px solid var(--line); border-radius: 2px; padding: 4px 8px;
+    background: var(--card);
+  }
+
+  .rows { margin-bottom: 34px; }
+  .row {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 14px;
+    padding: 11px 0; border-bottom: 1px solid var(--line);
+  }
+  .row .k {
+    font: 700 10px/1 Verdana, sans-serif;
+    letter-spacing: .25em; text-transform: uppercase; color: var(--muted);
+  }
+  .row .v { font: 13px/1.4 "Courier New", monospace; color: var(--ink); text-align: right; }
+  .row .v.ok { color: var(--moss-d); }
+  .row .v.warn { color: var(--amber); }
+  .row .v.err { color: var(--terra); }
+  .row .v.none { color: var(--muted); }
+
+  #btn {
+    width: 100%; padding: 16px;
+    background: var(--ink); color: var(--paper);
+    border: none; border-radius: 2px;
+    font: 700 13px/1 Verdana, sans-serif;
+    letter-spacing: .3em; text-transform: uppercase;
+    cursor: pointer;
+  }
+  #btn:hover { background: var(--moss-d); }
+  #btn:active { background: #232119; }
+  #btn.disabled { background: var(--line); color: var(--muted); cursor: not-allowed; }
+
+  #msg {
+    margin-top: 14px; font-size: 13px; font-style: italic;
+    color: var(--muted); text-align: center; min-height: 20px;
+  }
+  #msg.err { color: var(--terra); font-style: normal; }
+  #msg.warn { color: var(--amber); }
+  #msg.ok { color: var(--moss-d); }
+
+  .foot {
+    margin-top: 44px; padding-top: 14px; border-top: 1px solid var(--line);
+    font-size: 11px; color: var(--muted); text-align: center; line-height: 1.7;
+  }
+</style>
 </head>
 <body>
-<p>Redirecting to <a href="slopkit_ref/slopkit/bagagwa.html">exploit page</a>...</p>
+<div class="sheet">
+
+  <div class="wordmark"><span>ziz</span><i>ps5 &middot; 2026</i></div>
+
+  <h1>Demon <span>Bagagwa</span></h1>
+  <p class="tagline">WebKit userland &rarr; aio UAF chain &rarr; kernel</p>
+
+  <div class="fwline">
+    <span class="dot" id="fw-dot"></span>
+    <span class="lbl">firmware</span>
+    <span class="val" id="fw-val">detecting&hellip;</span>
+    <span class="tag" id="fw-tag">&mdash;</span>
+  </div>
+
+  <div class="rows">
+    <div class="row">
+      <span class="k">offsets</span>
+      <span class="v none" id="i-off">&mdash;</span>
+    </div>
+    <div class="row">
+      <span class="k">range</span>
+      <span class="v ok">09.00 &rarr; 13.60</span>
+    </div>
+    <div class="row">
+      <span class="k">exploit</span>
+      <span class="v ok">webkit heap &mdash; aio UAF chain</span>
+    </div>
+    <div class="row">
+      <span class="k">cache</span>
+      <span class="v none">direct &mdash; nothing cached</span>
+    </div>
+  </div>
+
+  <button id="btn" class="disabled">Launch</button>
+  <div id="msg">checking firmware&hellip;</div>
+
+  <div class="foot">
+    Demon Bagagwa &middot; ZiZ &middot; experimental project for educational &amp; research use &middot; 2026
+  </div>
+
+</div>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+
+  // Same detection as slopkit main.js: /PlayStation 5\/(\d+\.\d+)/
+  var fwMatch = /PlayStation 5\/(\d+\.\d+)/.exec(navigator.userAgent);
+  var fw = fwMatch ? fwMatch[1] : "";
+
+  var supportedFirmwares = [
+    "9.00", "9.05", "9.20", "9.40", "9.60", "10.00", "10.01", "10.20",
+    "10.40", "10.60", "11.00", "11.20", "11.40", "11.60", "12.00",
+    "12.02", "12.20", "12.40", "12.60", "12.70",
+    "13.00", "13.20", "13.40", "13.60"
+  ];
+
+  var entry = null;
+
+  if (!fw) {
+    $("fw-val").textContent = "not a PS5 browser";
+    $("fw-dot").className = "dot err";
+    $("fw-tag").textContent = "unsupported";
+    $("msg").textContent = "Open on your PS5 browser.";
+    $("msg").className = "err";
+  } else if (supportedFirmwares.indexOf(fw) >= 0) {
+    entry = true;
+    $("fw-val").textContent = fw;
+    $("fw-dot").className = "dot ok";
+    $("fw-tag").textContent = "exact match";
+    $("i-off").textContent = "profile loaded \u2713";
+    $("i-off").className = "v ok";
+    $("msg").textContent = "Firmware " + fw + " supported \u2014 ready when you are.";
+    $("msg").className = "ok";
+    $("btn").classList.remove("disabled");
+  } else {
+    // nearest same-major fallback, same idea as main.js nearestOffset()
+    var maj = fw.split(".")[0];
+    var cand = supportedFirmwares.filter(function (f) {
+      return f.indexOf(maj + ".") === 0;
+    }).sort().reverse();
+    if (cand.length) {
+      entry = true;
+      $("fw-val").textContent = fw;
+      $("fw-dot").className = "dot warn";
+      $("fw-tag").textContent = "nearest: " + cand[0];
+      $("i-off").textContent = "interpolated from " + cand[0];
+      $("i-off").className = "v warn";
+      $("msg").textContent = "No exact profile for " + fw + " \u2014 using " + cand[0] + ".";
+      $("msg").className = "warn";
+      $("btn").classList.remove("disabled");
+    } else {
+      $("fw-val").textContent = fw;
+      $("fw-dot").className = "dot err";
+      $("fw-tag").textContent = "no offsets";
+      $("msg").textContent = "Firmware " + fw + " is not supported.";
+      $("msg").className = "err";
+    }
+  }
+
+  // Launch: forward the ENTIRE query string untouched, so every flag
+  // (?log ?auto ?max ?n ?rd ?notify ?leak727 ?leakshape ?chaindelay ...)
+  // reaches bagagwa.html exactly as typed.
+  $("btn").addEventListener("click", function () {
+    if (!entry) return;
+    location.href = "slopkit_ref/slopkit/bagagwa.html" + (location.search || "");
+  });
+})();
+</script>
 </body>
 </html>
